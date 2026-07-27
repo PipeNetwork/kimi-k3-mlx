@@ -320,19 +320,29 @@ class TestPlanValidation(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("out-of-range", r.stdout + r.stderr)
 
-    def test_rejects_graded_plan_with_an_explanation(self):
+    def test_rejects_three_bit_widths(self):
         fk = tiny_config()["text_config"]["first_k_dense_replace"]
-        plan_path = os.path.join(self.tmp, "graded.json")
+        plan_path = os.path.join(self.tmp, "three.json")
         plan = make_plan(plan_path, {L: [0, 1, 2, 3] for L in range(fk, NLAYERS)})
         for entry in plan["layers"].values():
-            entry["bits"] = {"0": "mxfp4", "1": "mxfp4", "2": "2bit", "3": "2bit"}
+            entry["bits"] = {"0": "mxfp4", "1": "3bit", "2": "2bit", "3": "2bit"}
         json.dump(plan, open(plan_path, "w"))
         r = run_convert(self.src, os.path.join(self.tmp, "o3"), plan=plan_path,
                         expect_fail=True)
         self.assertNotEqual(r.returncode, 0)
-        msg = r.stdout + r.stderr
-        self.assertIn("bit widths", msg)
-        self.assertIn("gather_qmm", msg)
+        self.assertIn("exactly two", r.stdout + r.stderr)
+
+    def test_rejects_graded_without_mxfp4_tier(self):
+        fk = tiny_config()["text_config"]["first_k_dense_replace"]
+        plan_path = os.path.join(self.tmp, "nohi.json")
+        plan = make_plan(plan_path, {L: [0, 1, 2, 3] for L in range(fk, NLAYERS)})
+        for entry in plan["layers"].values():
+            entry["bits"] = {"0": "3bit", "1": "3bit", "2": "2bit", "3": "2bit"}
+        json.dump(plan, open(plan_path, "w"))
+        r = run_convert(self.src, os.path.join(self.tmp, "o4"), plan=plan_path,
+                        expect_fail=True)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("mxfp4 tier", r.stdout + r.stderr)
 
     def test_prune_works_with_lossy_profiles_too(self):
         fk = tiny_config()["text_config"]["first_k_dense_replace"]
@@ -346,6 +356,127 @@ class TestPlanValidation(unittest.TestCase):
             self.assertEqual(w.shape[0], 4)
             self.assertIn(f"model.layers.{L}.block_sparse_moe.switch_mlp.gate_proj.biases", W)
 
+
+
+
+class TestGradedTwoBank(unittest.TestCase):
+    """Graded plans build a TwoBankSwitchGLU and must stay faithful.
+
+    The key check is that when BOTH banks are given mxfp4 -- i.e. the split is
+    purely structural, no precision change -- the two-bank model must reproduce
+    a plain single-bank build exactly. That isolates the bank machinery
+    (reordering, sorted-pair partition, unsort) from quantization error, so a
+    partition bug cannot hide behind "well, 2-bit is lossy".
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="graded-")
+        cls.src = os.path.join(cls.tmp, "src")
+        build_fixture(cls.src)
+        cls.fk = tiny_config()["text_config"]["first_k_dense_replace"]
+        cls.moe = [L for L in range(NLAYERS) if L >= cls.fk]
+        cls.toks = mx.array([[3, 9, 21, 6, 15]])
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def _graded_plan(self, path, hi, lo, lo_bits="2bit"):
+        plan = {"mode": "graded", "top_k": 2, "num_experts": NE,
+                "min_experts": 2, "layers": {}}
+        for L in self.moe:
+            plan["layers"][str(L)] = {
+                "keep": sorted(hi + lo),
+                "bits": {**{str(e): "mxfp4" for e in hi},
+                         **{str(e): lo_bits for e in lo}},
+            }
+        json.dump(plan, open(path, "w"))
+        return plan
+
+    def _load(self, path):
+        import pathlib
+
+        from mlx_lm.utils import load_model
+
+        m, _ = load_model(pathlib.Path(path), lazy=False)
+        return m
+
+    def test_two_banks_at_same_precision_match_single_bank(self):
+        hi, lo = [0, 2], [4, 6]
+        uni = os.path.join(self.tmp, "uni")
+        make_plan(os.path.join(self.tmp, "uni.json"), {L: hi + lo for L in self.moe})
+        run_convert(self.src, uni, plan=os.path.join(self.tmp, "uni.json"))
+
+        gp = os.path.join(self.tmp, "graded_same.json")
+        self._graded_plan(gp, hi, lo, lo_bits="8bit")
+        out = os.path.join(self.tmp, "graded_same")
+        run_convert(self.src, out, plan=gp)
+
+        W = load_all(out)
+        for L in self.moe:
+            base = f"model.layers.{L}.block_sparse_moe.switch_mlp"
+            self.assertIn(f"{base}.bank_hi.gate_proj.weight", W)
+            self.assertIn(f"{base}.bank_lo.gate_proj.weight", W)
+            self.assertEqual(W[f"{base}.bank_hi.gate_proj.weight"].shape[0], len(hi))
+            self.assertEqual(W[f"{base}.bank_lo.gate_proj.weight"].shape[0], len(lo))
+            self.assertNotIn(f"{base}.gate_proj.weight", W)
+
+        cfg = json.load(open(os.path.join(out, "config.json")))
+        tc = cfg.get("text_config", cfg)
+        for L in self.moe:
+            self.assertEqual(tc["expert_bank_split"][L], len(hi))
+        q = cfg["quantization"]
+        for L in self.moe:
+            base = f"model.layers.{L}.block_sparse_moe.switch_mlp"
+            self.assertEqual(q[f"{base}.bank_hi.gate_proj"]["mode"], "mxfp4")
+            self.assertEqual(q[f"{base}.bank_lo.gate_proj"]["bits"], 8)
+
+        m = self._load(out)
+        o = m(self.toks)
+        mx.eval(o)
+        self.assertFalse(bool(mx.any(mx.isnan(o))))
+
+    def test_graded_hi_tier_is_bit_exact_from_source(self):
+        """bank_hi is a byte copy of the source experts, pruning notwithstanding."""
+        hi, lo = [1, 5], [3, 7]
+        gp = os.path.join(self.tmp, "graded.json")
+        self._graded_plan(gp, hi, lo)
+        out = os.path.join(self.tmp, "graded")
+        run_convert(self.src, out, plan=gp)
+
+        W, srcW = load_all(out), load_all_source(self.src)
+        for L in self.moe:
+            for w, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
+                base = f"model.layers.{L}.block_sparse_moe.switch_mlp.bank_hi.{dst}"
+                got, gs = W[f"{base}.weight"], W[f"{base}.scales"]
+                for new_i, old_i in enumerate(hi):
+                    sb = (f"language_model.model.layers.{L}.block_sparse_moe"
+                          f".experts.{old_i}.{w}")
+                    self.assertTrue(bool(mx.all(
+                        got[new_i] == srcW[f"{sb}.weight_packed"].view(mx.uint32))))
+                    self.assertTrue(bool(mx.all(gs[new_i] == srcW[f"{sb}.weight_scale"])))
+            # low tier is affine -> carries biases, high tier (mxfp4) does not
+            lo_base = f"model.layers.{L}.block_sparse_moe.switch_mlp.bank_lo.gate_proj"
+            self.assertIn(f"{lo_base}.biases", W)
+            hi_base = f"model.layers.{L}.block_sparse_moe.switch_mlp.bank_hi.gate_proj"
+            self.assertNotIn(f"{hi_base}.biases", W)
+
+    def test_router_maps_hi_tier_to_leading_indices(self):
+        """Graded reorders keep to hi-then-lo; the gate must follow that order."""
+        hi, lo = [1, 5], [3, 7]
+        gp = os.path.join(self.tmp, "graded2.json")
+        self._graded_plan(gp, hi, lo)
+        out = os.path.join(self.tmp, "graded2")
+        run_convert(self.src, out, plan=gp)
+
+        W, srcW = load_all(out), load_all_source(self.src)
+        for L in self.moe:
+            orig = srcW[f"language_model.model.layers.{L}.block_sparse_moe.gate.weight"]
+            got = W[f"model.layers.{L}.block_sparse_moe.gate.weight"]
+            for new_i, old_i in enumerate(hi + lo):        # hi first, NOT sorted
+                self.assertTrue(bool(mx.all(got[new_i] == orig[old_i])),
+                                f"L{L}: gate row {new_i} should be old {old_i}")
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -27,6 +27,7 @@ from typing import Any, Dict, List, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
+import numpy as np
 
 from .base import (
     BaseModelArgs,
@@ -83,6 +84,9 @@ class ModelArgs(BaseModelArgs):
     # REAP-pruned checkpoints keep a different number of experts per layer
     # (0 for dense layers). None => every MoE layer has `num_experts`.
     expert_counts: Optional[List[int]] = None
+    # Graded REAP: per layer, how many of that layer's experts sit in the
+    # high-precision bank. 0 (or None) => a single uniform-width bank.
+    expert_bank_split: Optional[List[int]] = None
     # multimodal wrapper fields (ignored by the text tower)
     vision_config: Dict[str, Any] = field(default_factory=dict)
 
@@ -470,6 +474,93 @@ def _group_expert_select(
     return inds, weights.astype(orig.dtype)
 
 
+class TwoBankSwitchGLU(nn.Module):
+    """SwitchGLU whose experts are split into two banks at different bit widths.
+
+    Experts [0, n_hi) live in `bank_hi`, [n_hi, n_hi+n_lo) in `bank_lo`. This
+    exists because MLX pins one bit width per expert tensor: QuantizedSwitchLinear
+    stores scalar bits/group_size/mode and gather_qmm takes them as scalars. Two
+    modules means two widths, which is what graded REAP needs -- most-salient
+    experts at mxfp4 (free on K3, it is the source encoding), the rest lower.
+
+    The naive way to do this costs 2x expert compute: run both banks over every
+    routed pair and select. Instead we exploit the sort SwitchGLU already
+    performs. After sorting (token, slot) pairs by expert index, a bank owning a
+    contiguous index range owns a contiguous *slice* of the sorted pairs, so
+    each bank does exactly its own share of the work and no more.
+
+    Cost: the split point is data-dependent, so it must be read back to the
+    host to slice on. Measured at K3 REAP dims (3584->3072, 240 experts,
+    top-16), that sync is essentially the *entire* overhead -- the second
+    dispatch is nearly free:
+
+        prefill (256 tok)   1.05x vs single-bank
+        decode  (1 tok)     1.16x
+
+    Decode routes only top_k pairs, too few to amortise two kernel launches
+    plus a device sync, so below PARTITION_ON_HOST pairs we pull the indices
+    down in one transfer and partition with numpy instead. That alone took
+    decode from 1.44x to 1.16x.
+    """
+
+    # Below this many (token, slot) pairs, partition on the host.
+    PARTITION_ON_HOST = 1024
+
+    def __init__(self, input_dims, hidden_dims, n_hi, n_lo, activation):
+        super().__init__()
+        if n_hi <= 0 or n_lo <= 0:
+            raise ValueError(f"both banks must be non-empty, got {n_hi}/{n_lo}")
+        self.n_hi, self.n_lo = n_hi, n_lo
+        self.bank_hi = SwitchGLU(input_dims, hidden_dims, n_hi, activation=activation)
+        self.bank_lo = SwitchGLU(input_dims, hidden_dims, n_lo, activation=activation)
+
+    @property
+    def num_experts(self):
+        return self.n_hi + self.n_lo
+
+    @staticmethod
+    def _run(bank, xp, idx):
+        """One bank over an already-sorted slice of pairs."""
+        up = bank.up_proj(xp, idx, sorted_indices=True)
+        gate = bank.gate_proj(xp, idx, sorted_indices=True)
+        return bank.down_proj(bank.activation(up, gate), idx, sorted_indices=True)
+
+    def __call__(self, x: mx.array, indices: mx.array) -> mx.array:
+        lead = indices.shape[:-1]
+        K = indices.shape[-1]
+        flat = indices.reshape(-1)
+
+        total = flat.size
+        if total <= self.PARTITION_ON_HOST:
+            # one host transfer beats argsort-kernel + sum-kernel + sync
+            host = np.array(flat.tolist(), dtype=np.int32)
+            order = mx.array(np.argsort(host, kind="stable"))
+            split = int((host < self.n_hi).sum())
+        else:
+            order = mx.argsort(flat)
+            split = int(mx.sum(flat < self.n_hi))
+
+        inv_order = mx.argsort(order)
+        sorted_idx = flat[order]
+        # one row per (token, slot) pair, in expert order
+        pairs = mx.expand_dims(x, (-2, -3)).flatten(0, -3)[order // K]
+
+        if split == 0:
+            out = self._run(self.bank_lo, pairs, sorted_idx - self.n_hi)
+        elif split == total:
+            out = self._run(self.bank_hi, pairs, sorted_idx)
+        else:
+            out = mx.concatenate(
+                [
+                    self._run(self.bank_hi, pairs[:split], sorted_idx[:split]),
+                    self._run(self.bank_lo, pairs[split:], sorted_idx[split:] - self.n_hi),
+                ],
+                axis=0,
+            )
+
+        return mx.unflatten(out[inv_order], 0, (*lead, K)).squeeze(-2)
+
+
 class KimiSparseMoE(nn.Module):
     """LatentMoE: 896 experts run in a 3584-d latent, not the 7168-d residual.
 
@@ -477,23 +568,38 @@ class KimiSparseMoE(nn.Module):
     plus 2 shared experts applied to the *undown-projected* input.
     """
 
-    def __init__(self, args: ModelArgs, num_experts: Optional[int] = None):
+    def __init__(
+        self,
+        args: ModelArgs,
+        num_experts: Optional[int] = None,
+        bank_split: int = 0,
+    ):
         super().__init__()
         self.args = args
         h = args.hidden_size
         self.num_experts = num_experts if num_experts is not None else args.num_experts
+        self.bank_split = bank_split
         self.use_latent = args.routed_expert_hidden_size is not None
         self.moe_hidden = args.routed_expert_hidden_size if self.use_latent else h
         self.use_norm = args.latent_moe_use_norm
 
         self.gate = nn.Linear(h, self.num_experts, bias=False)
         self.e_score_correction_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
-        self.switch_mlp = SwitchGLU(
-            self.moe_hidden,
-            args.moe_intermediate_size,
-            self.num_experts,
-            activation=_situ_from_args(args),
-        )
+        if bank_split:
+            self.switch_mlp = TwoBankSwitchGLU(
+                self.moe_hidden,
+                args.moe_intermediate_size,
+                bank_split,
+                self.num_experts - bank_split,
+                activation=_situ_from_args(args),
+            )
+        else:
+            self.switch_mlp = SwitchGLU(
+                self.moe_hidden,
+                args.moe_intermediate_size,
+                self.num_experts,
+                activation=_situ_from_args(args),
+            )
 
         if self.use_latent:
             self.routed_expert_down_proj = nn.Linear(h, self.moe_hidden, bias=False)
@@ -573,6 +679,13 @@ def experts_in_layer(args: ModelArgs, idx: int) -> int:
     if args.expert_counts:
         return int(args.expert_counts[idx])
     return args.num_experts
+
+
+def bank_split_in_layer(args: ModelArgs, idx: int) -> int:
+    """How many of a layer's experts sit in the high-precision bank (0 = one bank)."""
+    if not args.expert_bank_split:
+        return 0
+    return int(args.expert_bank_split[idx])
 
 
 def remap_checkpoint(
@@ -685,7 +798,11 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % args.moe_layer_freq == 0
         )
         if is_moe:
-            self.block_sparse_moe = KimiSparseMoE(args, experts_in_layer(args, layer_idx))
+            self.block_sparse_moe = KimiSparseMoE(
+                args,
+                experts_in_layer(args, layer_idx),
+                bank_split_in_layer(args, layer_idx),
+            )
         else:
             self.mlp = KimiMLP(args)
         self.is_moe = is_moe

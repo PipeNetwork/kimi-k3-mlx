@@ -260,7 +260,7 @@ def load_prune_plan(path: Optional[str], args: kimi_k3.ModelArgs):
     model routes to the wrong experts while looking structurally perfect.
     """
     if not path:
-        return None
+        return None, None
     plan = json.load(open(path))
     top_k = args.num_experts_per_token
     keep = {}
@@ -276,17 +276,39 @@ def load_prune_plan(path: Optional[str], args: kimi_k3.ModelArgs):
             raise SystemExit(f"layer {idx} has duplicate or out-of-range expert ids")
         keep[idx] = ids
 
-    graded = any(len(set(v.get("bits", {}).values())) > 1 for v in plan["layers"].values())
-    if graded:
-        raise SystemExit(
-            "This plan assigns different bit widths to experts within a layer.\n"
-            "MLX cannot represent that: QuantizedSwitchLinear stores one weight\n"
-            "tensor with scalar bits/group_size/mode, and gather_qmm takes them\n"
-            "as scalars, so every expert in a layer shares a width. Supporting it\n"
-            "needs a two-bank SwitchGLU (2x expert compute, or a contiguous\n"
-            "partition over sorted indices). Use --mode uniform or global."
-        )
-    return keep
+    # Graded plans: experts within a layer carry two different bit widths, held
+    # by kimi_k3.TwoBankSwitchGLU. Experts are reordered so the high-precision
+    # bank is the leading contiguous range, which is what lets the two-bank
+    # forward split the sorted routing pairs with a single slice.
+    banks = {}
+    for k, v in plan["layers"].items():
+        idx = int(k)
+        bits = v.get("bits", {})
+        widths = set(bits.values())
+        if len(widths) <= 1:
+            banks[idx] = None
+            continue
+        if len(widths) > 2:
+            raise SystemExit(
+                f"layer {idx} uses {len(widths)} bit widths; TwoBankSwitchGLU "
+                f"supports exactly two"
+            )
+        hi = sorted(int(e) for e, b in bits.items() if b == "mxfp4")
+        lo = sorted(int(e) for e, b in bits.items() if b != "mxfp4")
+        if not hi or not lo:
+            raise SystemExit(f"layer {idx}: graded needs a non-empty mxfp4 tier")
+        if sorted(hi + lo) != keep[idx]:
+            raise SystemExit(
+                f"layer {idx}: bits cover {len(hi)+len(lo)} experts but keep "
+                f"lists {len(keep[idx])}"
+            )
+        lo_bits = {b for b in bits.values() if b != "mxfp4"}
+        if len(lo_bits) != 1:
+            raise SystemExit(f"layer {idx}: low tier mixes {lo_bits}")
+        # hi first -> new indices [0, len(hi)) are the high-precision bank
+        keep[idx] = hi + lo
+        banks[idx] = (len(hi), lo_bits.pop())
+    return keep, banks
 
 
 def convert(
@@ -300,9 +322,17 @@ def convert(
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
     args = kimi_k3.ModelArgs.from_dict(raw_cfg)
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
-    keep_map = load_prune_plan(prune_plan, args)
-    expert_counts = None
+    keep_map, bank_map = load_prune_plan(prune_plan, args)
+    expert_counts = bank_splits = None
     if keep_map is not None:
+        if bank_map and any(bank_map.values()):
+            bank_splits = [
+                (bank_map[i][0] if bank_map.get(i) else 0)
+                for i in range(args.num_hidden_layers)
+            ]
+            n_graded = sum(1 for v in bank_splits if v)
+            print(f"[{profile}] graded: {n_graded} layers use a two-bank "
+                  f"switch_mlp (mxfp4 + low tier)")
         expert_counts = [
             len(keep_map[i]) if i in keep_map else 0
             for i in range(args.num_hidden_layers)
@@ -378,16 +408,34 @@ def convert(
         if kimi_k3.is_moe_layer(args, i):
             moe = f"model.layers.{i}.block_sparse_moe.switch_mlp"
             keep = keep_map[i] if keep_map is not None else None
+            bank = bank_map.get(i) if bank_map else None
             for w, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
                 es = spec["expert"]
-                if es["mode"] == "mxfp4":
-                    t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
+                if bank is None:
+                    if es["mode"] == "mxfp4":
+                        t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
+                    else:
+                        t = expert_stack_requant(reader, i, w, args.num_experts, es, keep)
+                    emit(f"{moe}.{dst}", t)
+                    if es != spec["global_q"]:
+                        overrides[f"{moe}.{dst}"] = dict(es)
+                    del t
                 else:
-                    t = expert_stack_requant(reader, i, w, args.num_experts, es, keep)
-                emit(f"{moe}.{dst}", t)
-                if es != spec["global_q"]:
-                    overrides[f"{moe}.{dst}"] = dict(es)
-                del t
+                    # two banks: leading `n_hi` kept experts at mxfp4 (a byte
+                    # copy of the source), the remainder requantized.
+                    n_hi, lo_name = bank
+                    lo_spec = {"mode": "affine", "group_size": 64,
+                               "bits": int(lo_name[0])}
+                    hi_t = expert_stack_passthrough(reader, i, w, args.num_experts,
+                                                    keep[:n_hi])
+                    lo_t = expert_stack_requant(reader, i, w, args.num_experts,
+                                                lo_spec, keep[n_hi:])
+                    emit(f"{moe}.bank_hi.{dst}", hi_t)
+                    emit(f"{moe}.bank_lo.{dst}", lo_t)
+                    overrides[f"{moe}.bank_hi.{dst}"] = {
+                        "mode": "mxfp4", "group_size": 32, "bits": 4}
+                    overrides[f"{moe}.bank_lo.{dst}"] = dict(lo_spec)
+                    del hi_t, lo_t
                 gc.collect()
 
         print(
@@ -444,6 +492,8 @@ def convert(
         # num_experts is the widest layer; per-layer widths come from
         # expert_counts, which kimi_k3.experts_in_layer() reads.
         tc["num_experts"] = max(expert_counts)
+        if bank_splits is not None:
+            tc["expert_bank_split"] = bank_splits
         cfg["reap"] = {
             "plan": os.path.basename(prune_plan),
             "source_num_experts": args.num_experts,

@@ -269,16 +269,37 @@ Per-layer expert counts are recorded in `config.json` as `expert_counts`, so
 Planning modes: `uniform` (what published REAP models use), `global` (rank all
 layers together, with a routable floor of 4·top_k), and `graded`.
 
-**`graded` is sizing-only — it cannot be built.** The idea was to use REAP's
-saliency ranking to allocate bit-width instead of discarding it: top experts at
-mxfp4 (free on K3), mid experts lower, tail dropped — ~30% more experts in the
-same memory (313 vs 240 at 448 GB). MLX cannot represent it:
-`QuantizedSwitchLinear` holds one weight tensor per layer with scalar
-`bits`/`group_size`/`mode`, and `gather_qmm` takes them as scalars, so every
-expert in a layer shares a width. Realising it needs a two-bank `SwitchGLU` —
-either 2× expert compute (run both, select) or a contiguous partition over the
-already-sorted routing indices. `convert.py` rejects graded plans with that
-explanation rather than mis-building them.
+`graded` uses REAP's saliency ranking to allocate **bit-width** rather than
+discarding it: top experts at mxfp4 (free on K3), mid experts lower, tail
+dropped — ~30% more experts in the same memory (313 vs 240 at 448 GB).
+
+MLX pins one bit width per expert tensor (`QuantizedSwitchLinear` stores scalar
+`bits`/`group_size`/`mode`; `gather_qmm` takes them as scalars), so the two
+tiers live in two banks inside `kimi_k3.TwoBankSwitchGLU`.
+
+The naive two-bank forward costs 2× expert compute — run both banks over every
+routed pair and select. Instead it exploits the sort `SwitchGLU` already
+performs: once (token, slot) pairs are sorted by expert index, a bank owning a
+contiguous index range owns a contiguous *slice*, so each bank does exactly its
+own share. Measured at K3 REAP dims (3584→3072, 240 experts, top-16):
+
+| | vs single-bank |
+|---|---|
+| prefill (256 tok) | **1.05×** |
+| decode (1 tok) | **1.16×** |
+| memory, same expert count | **82%** |
+
+The split point is data-dependent, so it must reach the host to slice on — and
+that sync is essentially the entire overhead. Decode routes only `top_k` pairs,
+too few to amortise two kernel launches plus a device sync, so below 1024 pairs
+the indices come down in one transfer and partition with numpy. That alone took
+decode from 1.44× to 1.16×.
+
+Correctness rests on one test: give both banks the *same* weights and precision
+and the result must match a plain `SwitchGLU` **exactly** (it does, bit-for-bit,
+wherever single-bank also sorts). That isolates the partition/unsort machinery
+from quantization error, so a bug there cannot hide behind "the low tier is
+lossy".
 
 A caveat worth stating: K3's LatentMoE applies RMSNorm to the *combined* expert
 output before `up_proj`, so absolute expert norms are partly renormalized away

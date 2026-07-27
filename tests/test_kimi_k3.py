@@ -318,5 +318,79 @@ class TestCheckpointCoverage(unittest.TestCase):
         self.assertEqual(packed, 92 * 896 * 3)  # 92 MoE layers x 896 experts x w1/w2/w3
 
 
+class TestTwoBankSwitchGLU(unittest.TestCase):
+    """The two-bank MoE must be a pure refactor of SwitchGLU.
+
+    Graded REAP splits a layer's experts across two banks so they can carry
+    different bit widths (MLX pins one width per expert tensor). Give both banks
+    the SAME weights and precision and the result must match a single bank
+    exactly -- that isolates the partition/unsort machinery from quantization
+    error, so a bug there cannot hide behind "the low tier is lossy".
+    """
+
+    D, H, NE, K, N_HI = 64, 32, 8, 3, 5
+
+    def _pair(self):
+        from mlx_lm.models.switch_layers import SwitchGLU
+
+        mx.random.seed(0)
+        act = kimi_k3.SituGLU(4.0, 25.0)
+        single = SwitchGLU(self.D, self.H, self.NE, activation=act)
+        mx.eval(single.parameters())
+        two = kimi_k3.TwoBankSwitchGLU(
+            self.D, self.H, self.N_HI, self.NE - self.N_HI, activation=act
+        )
+        p = single.parameters()
+        two.bank_hi.update({k: {kk: vv[: self.N_HI] for kk, vv in v.items()}
+                            for k, v in p.items()})
+        two.bank_lo.update({k: {kk: vv[self.N_HI:] for kk, vv in v.items()}
+                            for k, v in p.items()})
+        mx.eval(two.parameters())
+        return single, two
+
+    def test_matches_single_bank(self):
+        single, two = self._pair()
+        for B, T in ((2, 64), (1, 1), (1, 4), (4, 128)):
+            x = mx.random.normal((B, T, self.D))
+            idx = mx.random.randint(0, self.NE, (B, T, self.K))
+            a, b = single(x, idx), two(x, idx)
+            mx.eval(a, b)
+            err = float(mx.abs(a - b).max())
+            # Exact where single-bank also sorts (>=64 routed pairs). Below that
+            # it skips its sort while we always sort, so summation order differs
+            # by float32 epsilon.
+            tol = 0.0 if idx.size >= 64 else 1e-6
+            self.assertLessEqual(err, tol, f"({B},{T}) pairs={idx.size} err={err}")
+
+    def test_handles_all_pairs_in_one_bank(self):
+        single, two = self._pair()
+        x = mx.random.normal((1, 8, self.D))
+        for lo, hi, label in ((0, self.N_HI, "all-hi"), (self.N_HI, self.NE, "all-lo")):
+            idx = mx.random.randint(lo, hi, (1, 8, self.K))
+            a, b = single(x, idx), two(x, idx)
+            mx.eval(a, b)
+            self.assertLess(float(mx.abs(a - b).max()), 1e-6, label)
+
+    def test_both_partition_paths_agree(self):
+        """Host partition (small) and device partition (large) must agree."""
+        _, two = self._pair()
+        x = mx.random.normal((1, 400, self.D))
+        idx = mx.random.randint(0, self.NE, (1, 400, self.K))
+        self.assertGreater(idx.size, two.PARTITION_ON_HOST)
+        dev = two(x, idx)
+        saved = two.PARTITION_ON_HOST
+        try:
+            two.PARTITION_ON_HOST = 10**9          # force the host path
+            host = two(x, idx)
+            mx.eval(dev, host)
+            self.assertEqual(float(mx.abs(dev - host).max()), 0.0)
+        finally:
+            two.PARTITION_ON_HOST = saved
+
+    def test_rejects_empty_bank(self):
+        with self.assertRaises(ValueError):
+            kimi_k3.TwoBankSwitchGLU(8, 8, 4, 0, activation=kimi_k3.SituGLU(4.0, 25.0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

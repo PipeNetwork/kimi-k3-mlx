@@ -12,14 +12,11 @@ graded    three tiers instead of keep/drop -- most-salient experts at mxfp4
           lower bit width, tail dropped. Fits ~30% more experts in the same
           memory than a binary cut.
 
-          NOT BUILDABLE TODAY. MLX's QuantizedSwitchLinear holds one weight
-          tensor per layer with scalar bits/group_size/mode, and gather_qmm
-          takes them as scalars, so every expert in a layer shares a width.
-          Realising graded needs a two-bank SwitchGLU -- either 2x expert
-          compute (run both banks, select) or a contiguous partition over the
-          already-sorted routing indices. scripts/convert.py rejects graded
-          plans rather than silently mis-building them; --mode graded is kept
-          because its sizing output is what justifies that work.
+          Built by kimi_k3.TwoBankSwitchGLU: MLX pins one bit width per expert
+          tensor, so the two tiers live in two SwitchGLU banks. The forward
+          splits the already-sorted routing pairs at the bank boundary, so each
+          bank does exactly its own share -- 1.05x prefill / 1.16x decode, not
+          the 2x a run-both-and-select scheme would cost.
 
 `global` and `graded` both need a floor: a layer stripped below top_k experts
 cannot route at all, and one near top_k routes degenerately. `--min-experts`
@@ -140,9 +137,8 @@ def main():
               f"{1-(n_hi+n_lo)/NE:.0%} dropped")
         print(f"density top-{TOPK}/{n_hi+n_lo} = {TOPK/(n_hi+n_lo):.1%}")
         print(f"size: {gb:.0f} GB")
-        print("NOTE: graded plans are sizing-only -- scripts/convert.py cannot "
-              "build them\n      (MLX pins one bit width per layer's expert "
-              "tensor). See the module docstring.")
+        print(f"built as TwoBankSwitchGLU: bank_hi={n_hi} mxfp4, "
+              f"bank_lo={n_lo} {a.lo_bits}")
         kept = [n_hi + n_lo] * nl
 
     # how much saliency mass survives -- the honest quality proxy available
