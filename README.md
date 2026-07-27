@@ -240,8 +240,9 @@ Peak is dominated by the AttnRes block stack (8 × tokens × 7168), not the
 weights. Disk reads 1.56 TB once.
 
 ```bash
+scripts/make_calib.py --out out/calib.txt --mb 12
 scripts/reap_calibrate.py --src Kimi-K3-src --out out/reap_saliency.npz \
-    --calib-text corpus.txt --seqs 64 --seqlen 2048
+    --calib-text out/calib.txt --seqs 64 --seqlen 2048
 scripts/reap_plan.py --saliency out/reap_saliency.npz --mode graded \
     --hi 0.15 --lo 0.20 --out out/reap_plan.json
 ```
@@ -300,6 +301,25 @@ and the result must match a plain `SwitchGLU` **exactly** (it does, bit-for-bit,
 wherever single-bank also sorts). That isolates the partition/unsort machinery
 from quantization error, so a bug there cannot hide behind "the low tier is
 lossy".
+
+**Calibration data is a modelling choice, not a formality.** Whatever the
+corpus under-represents gets pruned away silently — no error, no warning, just a
+model that looks fine until someone writes in the missing language.
+`scripts/make_calib.py` builds a deliberate mix: 40% code (multi-language +
+real Python files), 30% English web, 15% Chinese, 15% split across ja/ru/ko/de/
+fr/es/ar. Two things that had to be fixed by measurement rather than assumption:
+
+- C4's pooled `multilingual` config measured **97% Latin script** over its first
+  200 documents — effectively a second helping of English. Named per-language
+  configs replaced it.
+- With that pooled stream, CJK came to **0.03%** of the corpus. Chinese now has
+  an explicit share and lands at ~11% (14% of the prefix actually consumed).
+
+Sources are interleaved, not concatenated: `reap_calibrate.py` reads the first
+`seqs × seqlen` tokens, so a concatenated corpus would calibrate entirely on
+whichever source was written first. C4's `zh` split also carries some
+double-encoded documents whose mojibake still matches a naive "has CJK" test, so
+a CJK-fraction threshold filters them.
 
 A caveat worth stating: K3's LatentMoE applies RMSNorm to the *combined* expert
 output before `up_proj`, so absolute expert norms are partly renormalized away
