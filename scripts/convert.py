@@ -211,12 +211,13 @@ def quantize_tensor(w: mx.array, spec: Optional[Dict]) -> Dict[str, mx.array]:
 
 
 def expert_stack_passthrough(
-    reader: ShardReader, layer: int, w: str, n_experts: int
+    reader: ShardReader, layer: int, w: str, n_experts, keep=None
 ) -> Dict[str, mx.array]:
     """MXFP4 -> MLX mxfp4 with no arithmetic: reinterpret bytes, stack, done."""
     base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
+    order = keep if keep is not None else range(n_experts)
     packed, scales = [], []
-    for e in range(n_experts):
+    for e in order:
         packed.append(reader.get(f"{base}.{e}.{w}.weight_packed").view(mx.uint32))
         scales.append(reader.get(f"{base}.{e}.{w}.weight_scale"))
     out = {"weight": mx.stack(packed), "scales": mx.stack(scales)}
@@ -225,12 +226,13 @@ def expert_stack_passthrough(
 
 
 def expert_stack_requant(
-    reader: ShardReader, layer: int, w: str, n_experts: int, spec: Dict
+    reader: ShardReader, layer: int, w: str, n_experts, spec: Dict, keep=None
 ) -> Dict[str, mx.array]:
     """MXFP4 -> bf16 -> affine N-bit, one expert at a time (bounded memory)."""
     base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
+    order = keep if keep is not None else range(n_experts)
     qs, ss, bs = [], [], []
-    for e in range(n_experts):
+    for e in order:
         packed = reader.get(f"{base}.{e}.{w}.weight_packed").view(mx.uint32)
         scale = reader.get(f"{base}.{e}.{w}.weight_scale")
         dense = mx.dequantize(packed, scale, group_size=FP4_GROUP, bits=4, mode="mxfp4")
@@ -250,11 +252,65 @@ def expert_stack_requant(
 # -------------------------------------------------------------------- main
 
 
-def convert(src: str, out: str, profile: str, limit_layers: Optional[int] = None):
+def load_prune_plan(path: Optional[str], args: kimi_k3.ModelArgs):
+    """-> {layer_idx: [kept expert ids, ascending]} or None.
+
+    A REAP plan renumbers experts: new index i is old expert keep[i]. The router
+    gate rows and e_score_correction_bias must be reordered to match, or the
+    model routes to the wrong experts while looking structurally perfect.
+    """
+    if not path:
+        return None
+    plan = json.load(open(path))
+    top_k = args.num_experts_per_token
+    keep = {}
+    for k, v in plan["layers"].items():
+        idx = int(k)
+        ids = sorted(int(e) for e in v["keep"])
+        if len(ids) < top_k:
+            raise SystemExit(
+                f"layer {idx} keeps {len(ids)} experts but top-k is {top_k}; "
+                f"the router cannot select that many. Raise --min-experts."
+            )
+        if len(set(ids)) != len(ids) or ids[-1] >= args.num_experts:
+            raise SystemExit(f"layer {idx} has duplicate or out-of-range expert ids")
+        keep[idx] = ids
+
+    graded = any(len(set(v.get("bits", {}).values())) > 1 for v in plan["layers"].values())
+    if graded:
+        raise SystemExit(
+            "This plan assigns different bit widths to experts within a layer.\n"
+            "MLX cannot represent that: QuantizedSwitchLinear stores one weight\n"
+            "tensor with scalar bits/group_size/mode, and gather_qmm takes them\n"
+            "as scalars, so every expert in a layer shares a width. Supporting it\n"
+            "needs a two-bank SwitchGLU (2x expert compute, or a contiguous\n"
+            "partition over sorted indices). Use --mode uniform or global."
+        )
+    return keep
+
+
+def convert(
+    src: str,
+    out: str,
+    profile: str,
+    limit_layers: Optional[int] = None,
+    prune_plan: Optional[str] = None,
+):
     spec = profile_spec(profile)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
     args = kimi_k3.ModelArgs.from_dict(raw_cfg)
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+    keep_map = load_prune_plan(prune_plan, args)
+    expert_counts = None
+    if keep_map is not None:
+        expert_counts = [
+            len(keep_map[i]) if i in keep_map else 0
+            for i in range(args.num_hidden_layers)
+        ]
+        kept = [c for c in expert_counts if c]
+        print(f"[{profile}] REAP: keeping {min(kept)}-{max(kept)} of {args.num_experts} "
+              f"experts per layer (mean {sum(kept)/len(kept):.0f}, "
+              f"{sum(kept)/(len(kept)*args.num_experts):.1%})")
 
     reader = ShardReader(src, index)
     writer = ShardWriter(out)
@@ -289,6 +345,21 @@ def convert(src: str, out: str, profile: str, limit_layers: Optional[int] = None
         mapped = kimi_k3.remap_checkpoint(raw, args, layer_indices=[i], stack_experts=False)
         del raw
 
+        # Renumber the router to the kept experts. gate.weight is
+        # (num_experts, hidden) and e_score_correction_bias is (num_experts,);
+        # new row i must be old row keep[i]. Miss this and the model loads,
+        # runs, and routes every token to the wrong expert.
+        if keep_map is not None and i in keep_map:
+            sel = mx.array(keep_map[i])
+            moe = f"model.layers.{i}.block_sparse_moe"
+            # NOTE: remap_checkpoint has already dropped the `.gate.` segment
+            # from the correction bias. These are asserted rather than guarded
+            # with `if key in mapped` -- a silent no-op here does not fail, it
+            # ships a model that routes every token to the wrong expert.
+            for key in (f"{moe}.gate.weight", f"{moe}.e_score_correction_bias"):
+                assert key in mapped, f"router tensor {key} missing; cannot renumber"
+                mapped[key] = mx.take(mapped[key], sel, axis=0)
+
         for key, val in mapped.items():
             assert key.endswith(".weight") or key.endswith((".proj_weight", ".norm_weight", ".A_log", ".dt_bias", ".e_score_correction_bias")), key
             if key.endswith(".weight"):
@@ -306,12 +377,13 @@ def convert(src: str, out: str, profile: str, limit_layers: Optional[int] = None
         # ---- routed experts (the 97.9%)
         if kimi_k3.is_moe_layer(args, i):
             moe = f"model.layers.{i}.block_sparse_moe.switch_mlp"
+            keep = keep_map[i] if keep_map is not None else None
             for w, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
                 es = spec["expert"]
                 if es["mode"] == "mxfp4":
-                    t = expert_stack_passthrough(reader, i, w, args.num_experts)
+                    t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
                 else:
-                    t = expert_stack_requant(reader, i, w, args.num_experts, es)
+                    t = expert_stack_requant(reader, i, w, args.num_experts, es, keep)
                 emit(f"{moe}.{dst}", t)
                 if es != spec["global_q"]:
                     overrides[f"{moe}.{dst}"] = dict(es)
@@ -366,6 +438,17 @@ def convert(src: str, out: str, profile: str, limit_layers: Optional[int] = None
     q = dict(spec["global_q"])
     q.update(overrides)
     cfg["quantization"] = q
+    if expert_counts is not None:
+        tc = cfg.setdefault("text_config", cfg)
+        tc["expert_counts"] = expert_counts
+        # num_experts is the widest layer; per-layer widths come from
+        # expert_counts, which kimi_k3.experts_in_layer() reads.
+        tc["num_experts"] = max(expert_counts)
+        cfg["reap"] = {
+            "plan": os.path.basename(prune_plan),
+            "source_num_experts": args.num_experts,
+            "kept_mean": sum(c for c in expert_counts if c) / sum(1 for c in expert_counts if c),
+        }
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
 
@@ -394,5 +477,8 @@ if __name__ == "__main__":
                     choices=["mxfp4", "3bit", "2bit", "mixed2"])
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers (smoke testing)")
+    ap.add_argument("--prune-plan", default=None,
+                    help="REAP plan from scripts/reap_plan.py; prunes experts "
+                         "and renumbers the router to match")
     a = ap.parse_args()
-    convert(a.src, a.out, a.profile, a.limit_layers)
+    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan)

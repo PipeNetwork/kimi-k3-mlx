@@ -80,6 +80,9 @@ class ModelArgs(BaseModelArgs):
     # [K3-3]
     routed_expert_hidden_size: Optional[int] = None
     latent_moe_use_norm: bool = False
+    # REAP-pruned checkpoints keep a different number of experts per layer
+    # (0 for dense layers). None => every MoE layer has `num_experts`.
+    expert_counts: Optional[List[int]] = None
     # multimodal wrapper fields (ignored by the text tower)
     vision_config: Dict[str, Any] = field(default_factory=dict)
 
@@ -474,20 +477,21 @@ class KimiSparseMoE(nn.Module):
     plus 2 shared experts applied to the *undown-projected* input.
     """
 
-    def __init__(self, args: ModelArgs):
+    def __init__(self, args: ModelArgs, num_experts: Optional[int] = None):
         super().__init__()
         self.args = args
         h = args.hidden_size
+        self.num_experts = num_experts if num_experts is not None else args.num_experts
         self.use_latent = args.routed_expert_hidden_size is not None
         self.moe_hidden = args.routed_expert_hidden_size if self.use_latent else h
         self.use_norm = args.latent_moe_use_norm
 
-        self.gate = nn.Linear(h, args.num_experts, bias=False)
-        self.e_score_correction_bias = mx.zeros((args.num_experts,), dtype=mx.float32)
+        self.gate = nn.Linear(h, self.num_experts, bias=False)
+        self.e_score_correction_bias = mx.zeros((self.num_experts,), dtype=mx.float32)
         self.switch_mlp = SwitchGLU(
             self.moe_hidden,
             args.moe_intermediate_size,
-            args.num_experts,
+            self.num_experts,
             activation=_situ_from_args(args),
         )
 
@@ -519,7 +523,7 @@ class KimiSparseMoE(nn.Module):
         inds, weights = _group_expert_select(
             self.gate(x),
             self.e_score_correction_bias,
-            self.args.num_experts_per_token,
+            min(self.args.num_experts_per_token, self.num_experts),
             self.args.num_expert_group,
             self.args.topk_group,
             self.args.routed_scaling_factor,
@@ -562,6 +566,13 @@ def is_moe_layer(args: ModelArgs, idx: int) -> bool:
         and idx >= args.first_k_dense_replace
         and idx % args.moe_layer_freq == 0
     )
+
+
+def experts_in_layer(args: ModelArgs, idx: int) -> int:
+    """Expert count for one layer — varies after REAP pruning."""
+    if args.expert_counts:
+        return int(args.expert_counts[idx])
+    return args.num_experts
 
 
 def remap_checkpoint(
@@ -611,7 +622,7 @@ def remap_checkpoint(
                         weights[f"{src}.switch_mlp.{dst}.weight"] = mx.stack(
                             [
                                 weights.pop(f"{src}.experts.{e}.{w}.weight")
-                                for e in range(args.num_experts)
+                                for e in range(experts_in_layer(args, i))
                             ]
                         )
             bias_key = f"{src}.gate.e_score_correction_bias"
@@ -674,7 +685,7 @@ class KimiDecoderLayer(nn.Module):
             and layer_idx % args.moe_layer_freq == 0
         )
         if is_moe:
-            self.block_sparse_moe = KimiSparseMoE(args)
+            self.block_sparse_moe = KimiSparseMoE(args, experts_in_layer(args, layer_idx))
         else:
             self.mlp = KimiMLP(args)
         self.is_moe = is_moe

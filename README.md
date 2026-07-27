@@ -246,13 +246,39 @@ scripts/reap_plan.py --saliency out/reap_saliency.npz --mode graded \
     --hi 0.15 --lo 0.20 --out out/reap_plan.json
 ```
 
-Three planning modes: `uniform` (what published REAP models use), `global`
-(rank all layers together, with a routable floor of 4·top_k), and **`graded`** —
-precision as a third tier rather than binary keep/drop. Graded is only
-interesting on K3 because mxfp4 is free here: the top tier costs nothing, so the
-saliency ranking that REAP already computes can allocate bit-width instead of
-being thrown away. It fits ~30% more experts in the same memory (313 vs 240 at
-448 GB).
+Then apply the plan with any profile:
+
+```bash
+scripts/convert.py --src Kimi-K3-src --out out/Kimi-K3-REAP73-mxfp4 \
+    --profile mxfp4 --prune-plan out/reap_plan.json
+```
+
+Pruning **renumbers** experts — new index i is old expert `keep[i]` — so the
+router's `gate.weight` rows and `e_score_correction_bias` are reordered to
+match. Get that wrong and the model loads, runs, and emits fluent text while
+routing every token to the wrong expert; no shape check sees it. The converter
+asserts rather than guards on those two tensors, and
+`tests/test_prune_apply.py` pins the behaviour: an identity prune is bit-for-bit
+a no-op, and a pruned model must equal the full model with the dropped experts'
+correction bias set to −inf. A third test rotates the router rows to prove that
+equivalence check can actually detect misrouting.
+
+Per-layer expert counts are recorded in `config.json` as `expert_counts`, so
+`global` mode's uneven layers load correctly (`kimi_k3.experts_in_layer`).
+
+Planning modes: `uniform` (what published REAP models use), `global` (rank all
+layers together, with a routable floor of 4·top_k), and `graded`.
+
+**`graded` is sizing-only — it cannot be built.** The idea was to use REAP's
+saliency ranking to allocate bit-width instead of discarding it: top experts at
+mxfp4 (free on K3), mid experts lower, tail dropped — ~30% more experts in the
+same memory (313 vs 240 at 448 GB). MLX cannot represent it:
+`QuantizedSwitchLinear` holds one weight tensor per layer with scalar
+`bits`/`group_size`/`mode`, and `gather_qmm` takes them as scalars, so every
+expert in a layer shares a width. Realising it needs a two-bank `SwitchGLU` —
+either 2× expert compute (run both, select) or a contiguous partition over the
+already-sorted routing indices. `convert.py` rejects graded plans with that
+explanation rather than mis-building them.
 
 A caveat worth stating: K3's LatentMoE applies RMSNorm to the *combined* expert
 output before `up_proj`, so absolute expert norms are partly renormalized away
