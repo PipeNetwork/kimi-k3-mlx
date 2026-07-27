@@ -1,0 +1,322 @@
+"""Structural + numerical tests for the Kimi-K3 MLX port.
+
+No weights download required — the checkpoint key/shape coverage test reads the
+bundled `reference/model.safetensors.index.json.gz` plus a shape table captured
+from the real safetensors headers.
+
+Run:  python3 tests/test_kimi_k3.py
+"""
+
+import gzip
+import json
+import os
+import re
+import sys
+import unittest
+
+import mlx.core as mx
+import mlx.nn as nn
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+from mlx_lm.models import kimi_k3  # noqa: E402
+
+ROOT = os.path.join(os.path.dirname(__file__), "..")
+REF_CONFIG = os.path.join(ROOT, "reference", "config.json")
+REF_INDEX = os.path.join(ROOT, "reference", "model.safetensors.index.json.gz")
+
+
+def tiny_args(**over):
+    """A 6-layer / 8-expert K3 that keeps every architectural feature.
+
+    Layers 1..6 (1-based) -> kda for all but layer 4, matching K3's 1-based
+    config convention. attn_res_block_size=3 exercises two block pushes.
+    """
+    cfg = dict(
+        model_type="kimi_k3",
+        vocab_size=256,
+        hidden_size=64,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=4,
+        intermediate_size=128,
+        rms_norm_eps=1e-5,
+        linear_attn_config={
+            # head_dim must stay >= 64: mlx's gated_delta Metal kernel computes
+            # n_per_t = head_dim / 4 / 4 and emits a zero-length C++ array below
+            # that. Real K3 uses 128, so this is a test-fixture constraint only.
+            "head_dim": 64,
+            "num_heads": 4,
+            "short_conv_kernel_size": 4,
+            "kda_layers": [1, 2, 3, 5, 6],
+            "full_attn_layers": [4],
+            "use_full_rank_gate": True,
+            "gate_lower_bound": -5.0,
+        },
+        num_experts=8,
+        moe_intermediate_size=32,
+        kv_lora_rank=16,
+        q_lora_rank=24,
+        qk_nope_head_dim=16,
+        qk_rope_head_dim=8,
+        v_head_dim=16,
+        mla_use_nope=True,
+        mla_use_output_gate=True,
+        num_experts_per_token=2,
+        num_shared_experts=2,
+        first_k_dense_replace=1,
+        hidden_act="situ",
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
+        attn_res_block_size=3,
+        routed_expert_hidden_size=32,
+        latent_moe_use_norm=True,
+        tie_word_embeddings=False,
+    )
+    cfg.update(over)
+    return kimi_k3.ModelArgs.from_dict(cfg)
+
+
+class TestConfigParsing(unittest.TestCase):
+    def test_parses_nested_text_config(self):
+        raw = json.load(open(REF_CONFIG))
+        args = kimi_k3.ModelArgs.from_dict(raw)
+        self.assertEqual(args.model_type, "kimi_k3")
+        self.assertEqual(args.hidden_size, 7168)
+        self.assertEqual(args.num_hidden_layers, 93)
+        self.assertEqual(args.num_experts, 896)
+        self.assertEqual(args.num_experts_per_token, 16)
+        self.assertEqual(args.num_shared_experts, 2)
+        self.assertEqual(args.routed_expert_hidden_size, 3584)
+        self.assertEqual(args.moe_intermediate_size, 3072)
+        self.assertEqual(args.attn_res_block_size, 12)
+        self.assertEqual(args.q_lora_rank, 1536)
+        self.assertEqual(args.kv_lora_rank, 512)
+        self.assertTrue(args.mla_use_nope)
+        self.assertTrue(args.mla_use_output_gate)
+        self.assertEqual(args.activation_situ_beta, 4.0)
+        self.assertEqual(args.activation_situ_linear_beta, 25.0)
+
+    def test_layer_type_split_is_one_based(self):
+        """config full_attn_layers=[4,8,...] must map to tensor layers 3,7,..."""
+        args = kimi_k3.ModelArgs.from_dict(json.load(open(REF_CONFIG)))
+        kda = args.linear_attn_config["kda_layers"]
+        linear = [(i + 1) in kda for i in range(args.num_hidden_layers)]
+        mla_idx = [i for i, is_lin in enumerate(linear) if not is_lin]
+        self.assertEqual(
+            mla_idx,
+            [3, 7, 11, 15, 19, 23, 27, 31, 35, 39, 43, 47, 51, 55, 59, 63, 67, 71,
+             75, 79, 83, 87, 91, 92],
+        )
+        self.assertEqual(sum(linear), 69)
+        self.assertEqual(len(mla_idx), 24)
+
+
+class TestSitu(unittest.TestCase):
+    def test_matches_reference_formula(self):
+        beta, lbeta = 4.0, 25.0
+        act = kimi_k3.SituGLU(beta, lbeta)
+        mx.random.seed(0)
+        gate = mx.random.normal((5, 17)) * 6.0
+        up = mx.random.normal((5, 17)) * 6.0
+        got = act(up, gate)
+        g32, u32 = gate.astype(mx.float32), up.astype(mx.float32)
+        want = (
+            beta * mx.tanh(g32 / beta) * mx.sigmoid(g32)
+        ) * (lbeta * mx.tanh(u32 / lbeta))
+        self.assertLess(float(mx.abs(got - want).max()), 1e-6)
+
+    def test_saturates(self):
+        act = kimi_k3.SituGLU(4.0, 25.0)
+        big = mx.full((1, 4), 1e4)
+        out = act(big, big)
+        self.assertLess(float(mx.abs(out - 4.0 * 25.0).max()), 1e-3)
+
+
+class TestAttnRes(unittest.TestCase):
+    def test_is_convex_combination(self):
+        """Output must be a softmax-weighted average of the K+1 candidates."""
+        N, K, H = 3, 4, 32
+        mx.random.seed(1)
+        prefix = mx.random.normal((N, H))
+        blocks = mx.random.normal((N, K, H))
+        proj = mx.random.normal((1, H))
+        norm = mx.random.normal((H,))
+        out = kimi_k3._apply_attn_res(prefix, blocks, proj, norm, 1e-5)
+        self.assertEqual(out.shape, (N, H))
+
+        cand = mx.concatenate([blocks, mx.expand_dims(prefix, 1)], axis=1)
+        var = mx.mean(cand * cand, axis=-1, keepdims=True)
+        k = cand * mx.rsqrt(var + 1e-5)
+        scores = mx.sum(k * (norm * proj.reshape(-1)), axis=-1)
+        probs = mx.softmax(scores, axis=-1)
+        want = (mx.expand_dims(probs, 1) @ cand).squeeze(1)
+        self.assertLess(float(mx.abs(out - want).max()), 1e-4)
+        # probabilities sum to 1 -> output lies in the convex hull
+        self.assertLess(float(mx.abs(probs.sum(-1) - 1.0).max()), 1e-5)
+
+    def test_single_candidate_is_identity(self):
+        N, H = 2, 16
+        prefix = mx.random.normal((N, H))
+        empty = mx.zeros((N, 0, H))
+        out = kimi_k3._apply_attn_res(prefix, empty, mx.ones((1, H)), mx.ones((H,)), 1e-5)
+        self.assertLess(float(mx.abs(out - prefix).max()), 1e-4)
+
+
+class TestKdaGate(unittest.TestCase):
+    def test_A_log_broadcasts_per_channel(self):
+        """[K3-5] A_log is [head_dim] and must broadcast along the head-dim axis."""
+        args = tiny_args()
+        kda = kimi_k3.KimiDeltaAttention(args, 0)
+        self.assertEqual(kda.A_log.shape, (kda.head_dim,))
+        a = mx.zeros((2, 3, kda.num_heads, kda.head_dim))
+        g = kda._compute_g(a)
+        self.assertEqual(g.shape, (2, 3, kda.num_heads, kda.head_dim))
+        # identical across heads, varying across channels
+        kda.A_log = mx.arange(kda.head_dim).astype(mx.float32) * 0.1
+        kda.dt_bias = mx.zeros((kda.projection_dim,))
+        g = kda._compute_g(a)
+        self.assertLess(float(mx.abs(g[:, :, 0, :] - g[:, :, 1, :]).max()), 1e-6)
+        self.assertGreater(float(mx.abs(g[0, 0, 0, 0] - g[0, 0, 0, -1])), 1e-3)
+
+    def test_gate_lower_bound_clamps(self):
+        args = tiny_args()
+        kda = kimi_k3.KimiDeltaAttention(args, 0)
+        kda.A_log = mx.full((kda.head_dim,), 5.0)  # exp(5) ~ 148 -> huge decay
+        kda.dt_bias = mx.full((kda.projection_dim,), 5.0)
+        g = kda._compute_g(mx.zeros((1, 1, kda.num_heads, kda.head_dim)))
+        # clamped at exp(-5), not exp(-148*softplus(5))
+        self.assertAlmostEqual(float(g.min()), float(mx.exp(mx.array(-5.0))), places=5)
+
+
+class TestForward(unittest.TestCase):
+    def test_prefill_and_decode_agree(self):
+        args = tiny_args()
+        model = kimi_k3.Model(args)
+        model.eval()
+        mx.eval(model.parameters())
+
+        toks = mx.array([[3, 14, 15, 92, 65, 35, 89, 79]])
+        full = model(toks)
+        self.assertEqual(full.shape, (1, toks.shape[1], args.vocab_size))
+        self.assertFalse(bool(mx.any(mx.isnan(full))))
+
+        cache = model.make_cache()
+        outs = []
+        for i in range(toks.shape[1]):
+            outs.append(model(toks[:, i : i + 1], cache=cache))
+        stepwise = mx.concatenate(outs, axis=1)
+
+        # AttnRes + KDA recurrence must give the same answer either way.
+        diff = float(mx.abs(full - stepwise).max())
+        self.assertLess(diff, 2e-2, f"prefill/decode mismatch: {diff}")
+
+    def test_attn_res_pushes_expected_blocks(self):
+        args = tiny_args()
+        model = kimi_k3.Model(args)
+        pushes = [i for i in range(args.num_hidden_layers) if i % args.attn_res_block_size == 0]
+        self.assertEqual(pushes, [0, 3])
+        mx.eval(model.parameters())
+        out = model(mx.array([[1, 2, 3]]))
+        self.assertFalse(bool(mx.any(mx.isnan(out))))
+
+
+class TestCheckpointCoverage(unittest.TestCase):
+    """Every one of the 497,220 checkpoint tensors must land somewhere."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.args = kimi_k3.ModelArgs.from_dict(json.load(open(REF_CONFIG)))
+        with gzip.open(REF_INDEX) as f:
+            cls.keys = list(json.load(f)["weight_map"])
+
+    def test_key_count(self):
+        self.assertEqual(len(self.keys), 497220)
+
+    def test_every_key_is_consumed_or_deliberately_skipped(self):
+        args = self.args
+        kda = set(args.linear_attn_config["kda_layers"])
+        n_layers = args.num_hidden_layers
+
+        consumed, skipped, unknown = 0, 0, []
+        for k in self.keys:
+            if k.startswith(("vision_tower.", "mm_projector.")):
+                skipped += 1
+                continue
+            self.assertTrue(k.startswith("language_model."), k)
+            t = k[len("language_model.") :]
+            if t in (
+                "lm_head.weight",
+                "model.embed_tokens.weight",
+                "model.norm.weight",
+                "model.output_attn_res_proj.weight",
+                "model.output_attn_res_norm.weight",
+            ):
+                consumed += 1
+                continue
+            m = re.match(r"model\.layers\.(\d+)\.(.+)", t)
+            self.assertIsNotNone(m, k)
+            idx, rest = int(m.group(1)), m.group(2)
+            self.assertLess(idx, n_layers, k)
+            is_linear = (idx + 1) in kda
+
+            ok = False
+            if rest in (
+                "input_layernorm.weight",
+                "post_attention_layernorm.weight",
+                "self_attention_res_proj.weight",
+                "self_attention_res_norm.weight",
+                "mlp_res_proj.weight",
+                "mlp_res_norm.weight",
+            ):
+                ok = True
+            elif rest.startswith("self_attn."):
+                name = rest[len("self_attn.") :]
+                linear_names = {
+                    "q_proj.weight", "k_proj.weight", "v_proj.weight",
+                    "q_conv1d.weight", "k_conv1d.weight", "v_conv1d.weight",
+                    "f_a_proj.weight", "f_b_proj.weight", "b_proj.weight",
+                    "g_proj.weight", "o_proj.weight", "o_norm.weight",
+                    "A_log", "dt_bias",
+                }
+                mla_names = {
+                    "q_a_proj.weight", "q_b_proj.weight", "q_a_layernorm.weight",
+                    "kv_a_proj_with_mqa.weight", "kv_b_proj.weight",
+                    "kv_a_layernorm.weight", "g_proj.weight", "o_proj.weight",
+                }
+                ok = name in (linear_names if is_linear else mla_names)
+            elif rest.startswith("mlp."):
+                ok = idx < args.first_k_dense_replace and rest in (
+                    "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight"
+                )
+            elif rest.startswith("block_sparse_moe."):
+                name = rest[len("block_sparse_moe.") :]
+                if re.match(r"experts\.\d+\.w[123]\.weight(_packed|_scale)?$", name):
+                    e = int(name.split(".")[1])
+                    ok = e < args.num_experts
+                else:
+                    ok = name in (
+                        "gate.weight", "gate.e_score_correction_bias",
+                        "routed_expert_down_proj.weight", "routed_expert_up_proj.weight",
+                        "routed_expert_norm.weight",
+                        "shared_experts.gate_proj.weight",
+                        "shared_experts.up_proj.weight",
+                        "shared_experts.down_proj.weight",
+                    )
+            if ok:
+                consumed += 1
+            else:
+                unknown.append(k)
+
+        self.assertEqual(unknown[:20], [], f"{len(unknown)} unmapped keys")
+        self.assertEqual(consumed + skipped, len(self.keys))
+        self.assertEqual(skipped, 168)  # 27 blocks x 6 + patch_embed x2 + final_ln + proj x3
+
+    def test_mxfp4_experts_are_packed_pairs(self):
+        packed = sum(1 for k in self.keys if k.endswith(".weight_packed"))
+        scales = sum(1 for k in self.keys if k.endswith(".weight_scale"))
+        self.assertEqual(packed, scales)
+        self.assertEqual(packed, 92 * 896 * 3)  # 92 MoE layers x 896 experts x w1/w2/w3
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
