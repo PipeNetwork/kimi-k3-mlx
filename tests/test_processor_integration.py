@@ -103,5 +103,62 @@ class TestProcessorIntegration(unittest.TestCase):
         self.assertNotEqual(feats[0].shape[0], feats[1].shape[0])
 
 
+@unittest.skipUnless(HAVE_SRC and os.path.exists(os.path.join(SRC, "tiktoken.model")),
+                     "Kimi-K3-src tokenizer not downloaded")
+class TestTokenizer(unittest.TestCase):
+    """K3's tiktoken BPE, built without going through transformers.
+
+    Regression guard: pat_str in tokenization_kimi.py is a list of TRIPLE-quoted
+    raw strings joined by "|". Scraping it with a naive quoted-string regex
+    matches the empty string between the triple-quote delimiters, producing empty
+    alternatives that make tiktoken's Rust core panic ("range end index 2 out of
+    range for slice of length 0") only at ENCODE time -- the Encoding object
+    itself constructs fine. So assert on the pattern *and* actually encode.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        from reap_calibrate import build_tokenizer
+
+        cls.enc = build_tokenizer(SRC)
+
+    def test_vocab_size_matches_config(self):
+        cfg = json.load(open(os.path.join(SRC, "config.json")))
+        want = cfg["text_config"]["vocab_size"]
+        self.assertEqual(self.enc.n_vocab, want)
+
+    def test_pattern_has_no_empty_alternatives(self):
+        parts = self.enc._pat_str.split("|") if hasattr(self.enc, "_pat_str") else None
+        if parts is None:
+            self.skipTest("tiktoken does not expose the pattern")
+        self.assertTrue(all(p.strip() for p in parts), "empty regex alternative")
+
+    def test_round_trips_every_script_in_the_corpus(self):
+        for probe in (
+            "def merge_intervals(a, b):\n    return sorted(a + b)",
+            "机器学习模型很好",
+            "Привет мир",
+            "こんにちは世界",
+            "안녕하세요",
+            "مرحبا بالعالم",
+            "Grüße, Welt — çà et là",
+        ):
+            with self.subTest(probe=probe[:16]):
+                ids = self.enc.encode_ordinary(probe)
+                self.assertGreater(len(ids), 0)
+                self.assertLess(max(ids), self.enc.n_vocab)
+                self.assertEqual(self.enc.decode(ids), probe)
+
+    def test_round_trips_a_real_corpus_slice(self):
+        cal = os.path.join(ROOT, "out", "calib.txt")
+        if not os.path.exists(cal):
+            self.skipTest("no calibration corpus built")
+        txt = open(cal, encoding="utf-8").read(200_000)
+        ids = self.enc.encode_ordinary(txt)
+        self.assertEqual(self.enc.decode(ids), txt)
+        self.assertGreater(len(txt) / len(ids), 1.5)   # sane chars/token
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

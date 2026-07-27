@@ -61,25 +61,46 @@ def build_tokenizer(src: str):
     if not os.path.exists(vocab):
         raise FileNotFoundError(f"{vocab} not downloaded yet")
 
-    pat_str = None
     tk_py = os.path.join(src, "tokenization_kimi.py")
-    if os.path.exists(tk_py):
-        import re
+    if not os.path.exists(tk_py):
+        raise FileNotFoundError(tk_py)
 
-        text = open(tk_py).read()
-        m = re.search(r"pat_str\s*=\s*\"\|\"\.join\(\[(.*?)\]\)", text, re.S)
-        if m:
-            parts = re.findall(r'r?"((?:[^"\\]|\\.)*)"', m.group(1))
-            if parts:
-                pat_str = "|".join(p.encode().decode("unicode_escape") for p in parts)
-    if pat_str is None:
-        raise RuntimeError("could not recover pat_str from tokenization_kimi.py")
+    # Read pat_str by parsing the AST, not by regexing the source. The pattern
+    # is a list of TRIPLE-quoted raw strings joined by "|", and a naive
+    # `r?"(...)"` scrape matches the empty string between the `"""` delimiters
+    # -- yielding empty alternatives that make tiktoken's Rust core panic with
+    # "range end index 2 out of range for slice of length 0". literal_eval gives
+    # the exact strings, escapes and all.
+    import ast
 
+    pat_str = None
+    for node in ast.walk(ast.parse(open(tk_py).read())):
+        if not isinstance(node, ast.Assign):
+            continue
+        if not any(isinstance(t, ast.Name) and t.id == "pat_str" for t in node.targets):
+            continue
+        call = node.value
+        if (
+            isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute)
+            and call.func.attr == "join"
+        ):
+            pat_str = ast.literal_eval(call.func.value).join(
+                ast.literal_eval(call.args[0])
+            )
+        else:
+            pat_str = ast.literal_eval(call)
+        break
+    if not pat_str:
+        raise RuntimeError(f"could not recover pat_str from {tk_py}")
+
+    ranks = load_tiktoken_bpe(vocab)
+    # 256 reserved special-token ids sit above the merges; encode_ordinary never
+    # emits them, but declaring them keeps n_vocab honest at 163,840.
+    base = len(ranks)
+    specials = {f"<|reserved_special_token_{i}|>": base + i for i in range(256)}
     return tiktoken.Encoding(
-        name="kimi_k3",
-        pat_str=pat_str,
-        mergeable_ranks=load_tiktoken_bpe(vocab),
-        special_tokens={},
+        name="kimi_k3", pat_str=pat_str, mergeable_ranks=ranks, special_tokens=specials
     )
 
 
