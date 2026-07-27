@@ -1,0 +1,271 @@
+#!/usr/bin/env python3
+"""Streaming REAP calibration for Kimi-K3.
+
+REAP (Cerebras, github.com/CerebrasResearch/reap) scores each expert by
+
+    S_j = (1/|C|) * sum_{x in C_j} g_j(x) * ||e_j(x)||_2
+
+-- router gate times expert output norm, over a calibration set -- then keeps
+the most salient experts per layer and lets the router renormalize.
+
+The obstacle for K3 is that calibration nominally means running a 1.56 TB model,
+which does not fit on any Apple Silicon machine. It does not have to: the
+saliency of layer L depends only on the hidden states entering L, the router
+gates at L, and the expert outputs at L. Nothing downstream. So calibration
+streams exactly like scripts/convert.py -- build one layer, push the whole
+calibration set through it, record stats, free it, move on. Peak memory is one
+layer (~16 GB with mxfp4 experts) plus the resident activations.
+
+Experts are run as real mxfp4 quantized layers, so the arithmetic scored here is
+the arithmetic the published tier actually executes.
+
+Output: an .npz with `saliency` (n_moe_layers, n_experts) holding summed
+gate*norm, `counts` (routing frequency), plus the token total and layer index,
+consumed by scripts/reap_plan.py.
+
+Usage:
+  scripts/reap_calibrate.py --src Kimi-K3-src --out out/reap_saliency.npz \
+      --calib-text corpus.txt --seqs 64 --seqlen 2048
+"""
+
+import argparse
+import gc
+import json
+import os
+import sys
+import time
+from typing import Dict, List, Optional
+
+import mlx.core as mx
+import mlx.nn as nn
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+
+import convert  # ShardReader, expert_stack_passthrough  # noqa: E402
+from mlx_lm.models import kimi_k3  # noqa: E402
+from mlx_lm.models.base import create_attention_mask, create_ssm_mask  # noqa: E402
+
+
+# ----------------------------------------------------------------- tokenizer
+
+
+def build_tokenizer(src: str):
+    """K3 ships a plain tiktoken BPE; build it directly rather than through
+    transformers, whose API moved after the reference was written."""
+    import tiktoken
+    from tiktoken.load import load_tiktoken_bpe
+
+    vocab = os.path.join(src, "tiktoken.model")
+    if not os.path.exists(vocab):
+        raise FileNotFoundError(f"{vocab} not downloaded yet")
+
+    pat_str = None
+    tk_py = os.path.join(src, "tokenization_kimi.py")
+    if os.path.exists(tk_py):
+        import re
+
+        text = open(tk_py).read()
+        m = re.search(r"pat_str\s*=\s*\"\|\"\.join\(\[(.*?)\]\)", text, re.S)
+        if m:
+            parts = re.findall(r'r?"((?:[^"\\]|\\.)*)"', m.group(1))
+            if parts:
+                pat_str = "|".join(p.encode().decode("unicode_escape") for p in parts)
+    if pat_str is None:
+        raise RuntimeError("could not recover pat_str from tokenization_kimi.py")
+
+    return tiktoken.Encoding(
+        name="kimi_k3",
+        pat_str=pat_str,
+        mergeable_ranks=load_tiktoken_bpe(vocab),
+        special_tokens={},
+    )
+
+
+def load_calibration(args, src: str) -> mx.array:
+    """-> (seqs, seqlen) int32 token ids."""
+    if args.calib_tokens:
+        toks = np.load(args.calib_tokens)
+        print(f"[calib] pre-tokenized {toks.shape} from {args.calib_tokens}")
+        return mx.array(toks[: args.seqs, : args.seqlen].astype(np.int32))
+
+    if not args.calib_text:
+        raise SystemExit(
+            "need --calib-text (a corpus) or --calib-tokens (pre-tokenized .npy).\n"
+            "REAP saliency is only as representative as its calibration data; "
+            "there is no sensible default."
+        )
+
+    enc = build_tokenizer(src)
+    text = open(args.calib_text, errors="ignore").read()
+    ids = enc.encode_ordinary(text)
+    need = args.seqs * args.seqlen
+    if len(ids) < need:
+        raise SystemExit(
+            f"calibration corpus has {len(ids):,} tokens, need {need:,} "
+            f"({args.seqs} x {args.seqlen}). Use a bigger file or fewer seqs."
+        )
+    arr = np.array(ids[:need], dtype=np.int32).reshape(args.seqs, args.seqlen)
+    print(f"[calib] tokenized {len(ids):,} tokens -> {arr.shape}")
+    return mx.array(arr)
+
+
+# ------------------------------------------------------------ layer building
+
+
+class LayerStreamer:
+    """Builds one KimiDecoderLayer at a time and loads its weights from source."""
+
+    def __init__(self, src: str, args: kimi_k3.ModelArgs, index: Dict[str, str]):
+        self.src, self.args, self.index = src, args, index
+        self.reader = convert.ShardReader(src, index, keep=3)
+
+    def embed(self, tokens: mx.array) -> mx.array:
+        w = self.reader.get("language_model.model.embed_tokens.weight")
+        out = w[tokens]
+        mx.eval(out)
+        return out
+
+    def build(self, i: int) -> kimi_k3.KimiDecoderLayer:
+        a = self.args
+        layer = kimi_k3.KimiDecoderLayer(a, i)
+
+        if layer.is_moe:
+            # Score the same arithmetic the artifact runs: mxfp4 experts, which
+            # for K3 are a bit-exact reinterpretation of the source bytes.
+            nn.quantize(
+                layer.block_sparse_moe.switch_mlp, group_size=32, bits=4, mode="mxfp4"
+            )
+
+        prefix = f"language_model.model.layers.{i}."
+        raw = {
+            k: self.reader.get(k)
+            for k in self.index
+            if k.startswith(prefix) and ".experts." not in k
+        }
+        mapped = kimi_k3.remap_checkpoint(raw, a, layer_indices=[i], stack_experts=False)
+        strip = f"model.layers.{i}."
+        w = {k[len(strip):]: v for k, v in mapped.items() if k.startswith(strip)}
+
+        if layer.is_moe:
+            for src_name, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
+                t = convert.expert_stack_passthrough(self.reader, i, src_name, a.num_experts)
+                w[f"block_sparse_moe.switch_mlp.{dst}.weight"] = t["weight"]
+                w[f"block_sparse_moe.switch_mlp.{dst}.scales"] = t["scales"]
+
+        layer.load_weights(list(w.items()))
+        mx.eval(layer.parameters())
+        return layer
+
+
+# -------------------------------------------------------------------- main
+
+
+def calibrate(args):
+    cfg = json.load(open(os.path.join(args.src, "config.json")))
+    margs = kimi_k3.ModelArgs.from_dict(cfg)
+    index = json.load(open(os.path.join(args.src, "model.safetensors.index.json")))["weight_map"]
+
+    tokens = load_calibration(args, args.src)
+    n_seq, seq_len = tokens.shape
+    n_tokens = n_seq * seq_len
+
+    streamer = LayerStreamer(args.src, margs, index)
+    n_layers = args.layers or margs.num_hidden_layers
+    moe_layers = [i for i in range(n_layers) if kimi_k3.is_moe_layer(margs, i)]
+
+    print(f"[reap] {n_layers} layers ({len(moe_layers)} MoE), {margs.num_experts} experts, "
+          f"top-{margs.num_experts_per_token}")
+    print(f"[reap] calibration {n_seq} x {seq_len} = {n_tokens:,} tokens, "
+          f"chunk {args.batch} seq")
+
+    # split into chunks; activations for the whole set stay resident while each
+    # layer is loaded once, which is the entire point of streaming
+    chunks = [tokens[i : i + args.batch] for i in range(0, n_seq, args.batch)]
+    H = [streamer.embed(c) for c in chunks]
+    hidden = margs.hidden_size
+    use_res = margs.attn_res_block_size is not None
+    BR = [
+        mx.zeros((c.shape[0] * c.shape[1], 0, hidden), dtype=H[0].dtype) if use_res else None
+        for c in chunks
+    ]
+    ssm_masks = [create_ssm_mask(h, None) for h in H]
+    attn_masks = [create_attention_mask(h, None, return_array=True) for h in H]
+
+    saliency = np.zeros((margs.num_hidden_layers, margs.num_experts), np.float64)
+    counts = np.zeros((margs.num_hidden_layers, margs.num_experts), np.float64)
+
+    t0 = time.time()
+    for i in range(n_layers):
+        lt = time.time()
+        layer = streamer.build(i)
+
+        sal = mx.zeros((margs.num_experts,), mx.float32)
+        cnt = mx.zeros((margs.num_experts,), mx.float32)
+
+        if layer.is_moe:
+            def hook(inds, weights, y):
+                nonlocal sal, cnt
+                # ||e_j(x)||_2 over the expert's output dim, in fp32
+                norms = mx.sqrt(mx.sum(y.astype(mx.float32) ** 2, axis=-1))
+                contrib = (weights.astype(mx.float32) * norms).reshape(-1)
+                idx = inds.reshape(-1)
+                sal = sal.at[idx].add(contrib)
+                cnt = cnt.at[idx].add(mx.ones_like(contrib))
+
+            layer.block_sparse_moe.expert_stats_hook = hook
+
+        for ci in range(len(chunks)):
+            h, br = layer(
+                H[ci],
+                ssm_masks[ci] if layer.is_linear else attn_masks[ci],
+                None,
+                BR[ci],
+            )
+            mx.eval(h, br if br is not None else h, sal, cnt)
+            H[ci], BR[ci] = h, br
+
+        if layer.is_moe:
+            layer.block_sparse_moe.expert_stats_hook = None
+            saliency[i] = np.array(sal, copy=True)
+            counts[i] = np.array(cnt, copy=True)
+            nz = int((counts[i] > 0).sum())
+            print(f"[reap] layer {i:3d}/{n_layers-1} MoE  {time.time()-lt:6.1f}s  "
+                  f"experts routed {nz}/{margs.num_experts}  "
+                  f"S mean {saliency[i].mean()/n_tokens:.4e}  "
+                  f"elapsed {(time.time()-t0)/60:5.1f}m", flush=True)
+        else:
+            print(f"[reap] layer {i:3d}/{n_layers-1} dense {time.time()-lt:6.1f}s", flush=True)
+
+        del layer
+        gc.collect()
+        if hasattr(mx, "clear_cache"):
+            mx.clear_cache()
+
+    os.makedirs(os.path.dirname(os.path.abspath(args.out)) or ".", exist_ok=True)
+    np.savez(
+        args.out,
+        saliency=saliency,
+        counts=counts,
+        n_tokens=np.array(n_tokens),
+        moe_layers=np.array(moe_layers),
+        num_experts=np.array(margs.num_experts),
+        top_k=np.array(margs.num_experts_per_token),
+        num_hidden_layers=np.array(margs.num_hidden_layers),
+    )
+    print(f"[reap] wrote {args.out}  ({(time.time()-t0)/60:.1f} min)")
+    return saliency, counts, n_tokens
+
+
+if __name__ == "__main__":
+    p = argparse.ArgumentParser()
+    p.add_argument("--src", required=True)
+    p.add_argument("--out", required=True)
+    p.add_argument("--calib-text", default=None, help="plain-text calibration corpus")
+    p.add_argument("--calib-tokens", default=None, help="pre-tokenized int .npy (seqs, len)")
+    p.add_argument("--seqs", type=int, default=64)
+    p.add_argument("--seqlen", type=int, default=2048)
+    p.add_argument("--batch", type=int, default=8, help="sequences per forward chunk")
+    p.add_argument("--layers", type=int, default=None, help="limit layers (smoke test)")
+    calibrate(p.parse_args())

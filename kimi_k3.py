@@ -506,6 +506,14 @@ class KimiSparseMoE(nn.Module):
         else:
             self.shared_experts = None
 
+        # Optional REAP saliency tap (scripts/reap_calibrate.py). Left as None in
+        # normal use and costs nothing. It exists so the calibration harness reads
+        # gates and per-expert outputs from *this* forward pass rather than a
+        # reimplementation that could drift from it. MLX keeps non-array
+        # attributes out of parameters()/children(), so this never touches
+        # quantization, saving or loading.
+        self.expert_stats_hook = None
+
     def __call__(self, x: mx.array) -> mx.array:
         identity = x
         inds, weights = _group_expert_select(
@@ -520,6 +528,10 @@ class KimiSparseMoE(nn.Module):
         )
         y = self.routed_expert_down_proj(x) if self.use_latent else x
         y = self.switch_mlp(y, inds)
+        if self.expert_stats_hook is not None:
+            # y here is the per-expert output BEFORE gate weighting, shape
+            # (..., top_k, moe_hidden) -- exactly what REAP saliency needs.
+            self.expert_stats_hook(inds, weights, y)
         y = (y * weights[..., None]).sum(axis=-2)
         if self.use_latent:
             if self.use_norm:

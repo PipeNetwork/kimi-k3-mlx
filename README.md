@@ -214,6 +214,53 @@ source. It reports **cosine similarity** per expert — quantization noise barel
 moves it, but a mis-stacked expert or a transposed projection drops it to ~0
 while magnitude statistics still look plausible.
 
+## REAP expert pruning
+
+`scripts/reap_calibrate.py` + `scripts/reap_plan.py`. This is the only route to
+a K3 that *runs* on a 512 GB machine — see [Reality check](#reality-check).
+
+REAP ([Cerebras](https://github.com/CerebrasResearch/reap)) scores each expert by
+`S_j = (1/|C|) Σ g_j(x)·‖e_j(x)‖₂` over a calibration set, keeps the most salient
+per layer, and lets the router renormalize.
+
+Calibration nominally means running a 1.56 TB model. It does not have to: the
+saliency of layer L depends only on the hidden states entering L, its router
+gates, and its expert outputs — **nothing downstream**. So it streams exactly
+like the converter: build one layer, push the whole calibration set through it,
+record, free, advance. Experts run as real mxfp4 quantized layers, so the
+arithmetic scored is the arithmetic the published tier executes.
+
+| calibration | peak RAM | expert compute |
+|---|---|---|
+| 32 × 2048 (64k tok) | ~32 GB | 6.4 PFLOP |
+| 64 × 2048 (128k tok) | ~41 GB | 12.7 PFLOP |
+| 128 × 2048 (256k tok) | ~58 GB | 25.5 PFLOP |
+
+Peak is dominated by the AttnRes block stack (8 × tokens × 7168), not the
+weights. Disk reads 1.56 TB once.
+
+```bash
+scripts/reap_calibrate.py --src Kimi-K3-src --out out/reap_saliency.npz \
+    --calib-text corpus.txt --seqs 64 --seqlen 2048
+scripts/reap_plan.py --saliency out/reap_saliency.npz --mode graded \
+    --hi 0.15 --lo 0.20 --out out/reap_plan.json
+```
+
+Three planning modes: `uniform` (what published REAP models use), `global`
+(rank all layers together, with a routable floor of 4·top_k), and **`graded`** —
+precision as a third tier rather than binary keep/drop. Graded is only
+interesting on K3 because mxfp4 is free here: the top tier costs nothing, so the
+saliency ranking that REAP already computes can allocate bit-width instead of
+being thrown away. It fits ~30% more experts in the same memory (313 vs 240 at
+448 GB).
+
+A caveat worth stating: K3's LatentMoE applies RMSNorm to the *combined* expert
+output before `up_proj`, so absolute expert norms are partly renormalized away
+downstream. That likely makes K3 more robust to pruning than a standard MoE, but
+it also means `‖e_j(x)‖` measures something partly cancelled — the criterion may
+want reformulating as relative contribution. Two shared experts fire on every
+token regardless and survive any pruning, giving a floor nothing touches.
+
 ## Build
 
 ```bash
