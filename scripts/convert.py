@@ -54,12 +54,20 @@ PASSTHROUGH_FILES = [
 # --------------------------------------------------------------- profiles
 
 
-def profile_spec(profile: str) -> Dict[str, object]:
+def profile_spec(profile: str, nonexpert_bits: Optional[int] = None) -> Dict[str, object]:
     if profile == "mxfp4":
+        # Non-experts default to bf16 (114 GB on K3 -- 2% of params but 23% of a
+        # REAP'd build's footprint). --nonexpert-bits trades that down; they were
+        # never MXFP4, so 8-bit there is a mild first quantization, unlike the
+        # experts where anything but mxfp4 is a lossy second pass.
+        other = (
+            None if nonexpert_bits is None
+            else {"mode": "affine", "group_size": 64, "bits": nonexpert_bits}
+        )
         return dict(
             expert={"mode": "mxfp4", "group_size": 32, "bits": 4},
-            other=None,  # bf16
-            gate=None,
+            other=other,
+            gate=other,
             global_q={"mode": "mxfp4", "group_size": 32, "bits": 4},
         )
     if profile in ("2bit", "3bit"):
@@ -317,8 +325,9 @@ def convert(
     profile: str,
     limit_layers: Optional[int] = None,
     prune_plan: Optional[str] = None,
+    nonexpert_bits: Optional[int] = None,
 ):
-    spec = profile_spec(profile)
+    spec = profile_spec(profile, nonexpert_bits)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
     args = kimi_k3.ModelArgs.from_dict(raw_cfg)
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
@@ -498,6 +507,10 @@ def convert(
             "plan": os.path.basename(prune_plan),
             "source_num_experts": args.num_experts,
             "kept_mean": sum(c for c in expert_counts if c) / sum(1 for c in expert_counts if c),
+            # new expert index i == source expert keep[i]. Recorded so the
+            # artifact is self-describing: without it nothing downstream can
+            # check a converted expert against the source it came from.
+            "keep": {str(k): v for k, v in sorted(keep_map.items())},
         }
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
@@ -527,8 +540,11 @@ if __name__ == "__main__":
                     choices=["mxfp4", "3bit", "2bit", "mixed2"])
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers (smoke testing)")
+    ap.add_argument("--nonexpert-bits", type=int, default=None,
+                    help="quantize non-expert tensors to N bits (mxfp4 profile "
+                         "keeps them bf16 by default: 114 GB on K3)")
     ap.add_argument("--prune-plan", default=None,
                     help="REAP plan from scripts/reap_plan.py; prunes experts "
                          "and renumbers the router to match")
     a = ap.parse_args()
-    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan)
+    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan, a.nonexpert_bits)

@@ -1,0 +1,33 @@
+REAP saliency — 92 MoE layers x 896 experts, top-16, 131,072 calibration tokens
+
+routing
+  (token, slot) pairs per layer : 2,097,152 (= 131,072 x 16)
+  mean pairs per expert         : 2,341
+  never routed                  : 15 / 82432 (0.018%)
+  routed <10% of average        : 1454 / 82432 (1.76%)
+  load imbalance (max/mean)     : 32.9x   (min 0.000x)
+
+concentration (share of layer saliency held by top-N experts)
+  top 10.0% ( 90 experts): mean 33.57%  min 22.66%  max 45.44%
+  top 25.0% (224 experts): mean 55.42%  min 43.28%  max 65.99%
+  top 37.5% (336 experts): mean 68.29%  min 57.22%  max 77.34%
+  top 50.0% (448 experts): mean 78.44%  min 69.07%  max 85.64%
+  top 75.0% (672 experts): mean 93.03%  min 88.18%  max 96.60%
+  -> top-25% holds +30.4% more mass than a uniform layer would
+
+per-layer variation (does `global` planning help?)
+  layer saliency mass: min 0.1678  median 6.7808  max 33.2175  (197.9x spread)
+  top-25% retention by layer: min 43.28%  max 65.99%
+  least prunable layers: [1, 2, 14, 25, 6]
+  most prunable layers : [12, 59, 56, 57, 53]
+
+retention curve (uniform keep, mxfp4 experts + 8-bit rest)
+    keep  experts  saliency kept     size
+    75%      672        93.03%    1146G
+    50%      448        78.44%     784G
+    38%      336        68.29%     603G
+    27%      242        57.72%     451G *
+    25%      224        55.42%     422G *
+    19%      168        47.50%     332G *
+    12%      112        37.97%     242G *
+  * fits 460 GB

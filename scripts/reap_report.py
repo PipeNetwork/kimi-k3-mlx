@@ -70,13 +70,27 @@ def main():
     print(f"  -> top-25% holds {flat_gap:+.1%} more mass than a uniform layer would")
 
     # ---- per-layer spread
+    #
+    # CAREFUL: raw layer mass is NOT an importance signal. Saliency is
+    # gate * ||expert_output||, so it scales with each layer's activation
+    # magnitude, which on K3 grows with depth. Worse, K3's LatentMoE applies
+    # RMSNorm to the *combined* expert output before up_proj, so that magnitude
+    # is renormalised away downstream -- a layer with 10x larger expert outputs
+    # is not 10x more important. Ranking (layer, expert) pairs across layers
+    # (`global` mode) would chase this artifact and starve early layers.
+    # Judge cross-layer differences on NORMALISED concentration instead.
     print("\nper-layer variation (does `global` planning help?)")
     layer_mass = sal.sum(1)
-    print(f"  layer saliency mass: min {layer_mass.min():.4f}  "
-          f"median {np.median(layer_mass):.4f}  max {layer_mass.max():.4f}  "
-          f"({layer_mass.max()/max(layer_mass.min(),1e-30):.1f}x spread)")
+    depth_r = np.corrcoef(np.arange(L), layer_mass)[0, 1]
+    print(f"  raw layer mass spread : {layer_mass.max()/max(layer_mass.min(),1e-30):.0f}x "
+          f"(corr with depth {depth_r:+.2f}) <- activation scale, NOT importance")
     c25 = cum[:, int(NE * 0.25) - 1]
-    print(f"  top-25% retention by layer: min {c25.min():.2%}  max {c25.max():.2%}")
+    print(f"  normalised top-25% retention: min {c25.min():.2%}  max {c25.max():.2%}  "
+          f"(spread {c25.max()-c25.min():.1%})")
+    if c25.max() - c25.min() < 0.30:
+        print("  -> layers are similarly prunable once scale is removed; prefer `uniform`.")
+    else:
+        print("  -> genuinely different concentration by layer; `global` may help.")
     hardest = [moe[i] for i in np.argsort(c25)[:5]]
     easiest = [moe[i] for i in np.argsort(-c25)[:5]]
     print(f"  least prunable layers: {hardest}")

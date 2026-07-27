@@ -104,12 +104,19 @@ def build_tokenizer(src: str):
     )
 
 
-def load_calibration(args, src: str) -> mx.array:
-    """-> (seqs, seqlen) int32 token ids."""
+def load_calibration(args, src: str):
+    """-> (seqs, seqlen) int32 token ids, and matching (seqs, seqlen) source ids.
+
+    Source ids let one calibration pass produce a saliency vector PER corpus
+    (code / English / Chinese / ...), which is what answers "do these languages
+    use the same experts?". Tokenizing document-by-document keeps the mapping
+    exact rather than approximating it from character offsets.
+    """
     if args.calib_tokens:
         toks = np.load(args.calib_tokens)
         print(f"[calib] pre-tokenized {toks.shape} from {args.calib_tokens}")
-        return mx.array(toks[: args.seqs, : args.seqlen].astype(np.int32))
+        t = toks[: args.seqs, : args.seqlen].astype(np.int32)
+        return mx.array(t), None, []
 
     if not args.calib_text:
         raise SystemExit(
@@ -120,16 +127,41 @@ def load_calibration(args, src: str) -> mx.array:
 
     enc = build_tokenizer(src)
     text = open(args.calib_text, errors="ignore").read()
-    ids = enc.encode_ordinary(text)
     need = args.seqs * args.seqlen
+
+    side = args.calib_text + ".sources.json"
+    labels, ids, src_ids = [], [], []
+    if os.path.exists(side):
+        man = json.load(open(side))
+        labels = sorted(set(man["order"]))
+        lut = {l: i for i, l in enumerate(labels)}
+        pos = 0
+        for lab, n in zip(man["order"], man["chars"]):
+            if len(ids) >= need:
+                break
+            doc_ids = enc.encode_ordinary(text[pos:pos + n])
+            pos += n
+            ids.extend(doc_ids)
+            src_ids.extend([lut[lab]] * len(doc_ids))
+        print(f"[calib] per-source tokenization over {len(labels)} sources: {labels}")
+    else:
+        ids = enc.encode_ordinary(text)
+        print("[calib] no .sources.json manifest -> single-bucket saliency")
+
     if len(ids) < need:
         raise SystemExit(
             f"calibration corpus has {len(ids):,} tokens, need {need:,} "
             f"({args.seqs} x {args.seqlen}). Use a bigger file or fewer seqs."
         )
     arr = np.array(ids[:need], dtype=np.int32).reshape(args.seqs, args.seqlen)
+    sarr = (np.array(src_ids[:need], dtype=np.int32).reshape(args.seqs, args.seqlen)
+            if src_ids else None)
     print(f"[calib] tokenized {len(ids):,} tokens -> {arr.shape}")
-    return mx.array(arr)
+    if sarr is not None:
+        for i, l in enumerate(labels):
+            print(f"[calib]   {l:<13} {(sarr==i).sum():>8,} tokens "
+                  f"({(sarr==i).mean():.1%})")
+    return mx.array(arr), (mx.array(sarr) if sarr is not None else None), labels
 
 
 # ------------------------------------------------------------ layer building
@@ -188,8 +220,9 @@ def calibrate(args):
     margs = kimi_k3.ModelArgs.from_dict(cfg)
     index = json.load(open(os.path.join(args.src, "model.safetensors.index.json")))["weight_map"]
 
-    tokens = load_calibration(args, args.src)
+    tokens, source_ids, labels = load_calibration(args, args.src)
     n_seq, seq_len = tokens.shape
+    n_src = max(1, len(labels))
     n_tokens = n_seq * seq_len
 
     streamer = LayerStreamer(args.src, margs, index)
@@ -204,6 +237,8 @@ def calibrate(args):
     # split into chunks; activations for the whole set stay resident while each
     # layer is loaded once, which is the entire point of streaming
     chunks = [tokens[i : i + args.batch] for i in range(0, n_seq, args.batch)]
+    src_chunks = ([source_ids[i : i + args.batch] for i in range(0, n_seq, args.batch)]
+                  if source_ids is not None else [None] * len(chunks))
     H = [streamer.embed(c) for c in chunks]
     hidden = margs.hidden_size
     use_res = margs.attn_res_block_size is not None
@@ -216,41 +251,60 @@ def calibrate(args):
 
     saliency = np.zeros((margs.num_hidden_layers, margs.num_experts), np.float64)
     counts = np.zeros((margs.num_hidden_layers, margs.num_experts), np.float64)
+    # per-source saliency: (source, layer, expert). 12 x 93 x 896 float64 = 8 MB.
+    per_src = np.zeros((n_src, margs.num_hidden_layers, margs.num_experts), np.float64)
+    per_src_cnt = np.zeros((n_src, margs.num_hidden_layers, margs.num_experts), np.float64)
 
     t0 = time.time()
     for i in range(n_layers):
         lt = time.time()
         layer = streamer.build(i)
 
-        sal = mx.zeros((margs.num_experts,), mx.float32)
-        cnt = mx.zeros((margs.num_experts,), mx.float32)
+        NE_ = margs.num_experts
+        sal = mx.zeros((NE_,), mx.float32)
+        cnt = mx.zeros((NE_,), mx.float32)
+        sal_s = mx.zeros((n_src * NE_,), mx.float32)
+        cnt_s = mx.zeros((n_src * NE_,), mx.float32)
+        cur_src = {"ids": None}
 
         if layer.is_moe:
             def hook(inds, weights, y):
-                nonlocal sal, cnt
+                nonlocal sal, cnt, sal_s, cnt_s
                 # ||e_j(x)||_2 over the expert's output dim, in fp32
                 norms = mx.sqrt(mx.sum(y.astype(mx.float32) ** 2, axis=-1))
                 contrib = (weights.astype(mx.float32) * norms).reshape(-1)
                 idx = inds.reshape(-1)
                 sal = sal.at[idx].add(contrib)
                 cnt = cnt.at[idx].add(mx.ones_like(contrib))
+                si = cur_src["ids"]
+                if si is not None:
+                    # Fold (source, expert) into one flat index so the per-source
+                    # split costs a single scatter, not one pass per source.
+                    s_exp = mx.repeat(si.reshape(-1), inds.shape[-1])
+                    comb = s_exp * NE_ + idx
+                    sal_s = sal_s.at[comb].add(contrib)
+                    cnt_s = cnt_s.at[comb].add(mx.ones_like(contrib))
 
             layer.block_sparse_moe.expert_stats_hook = hook
 
         for ci in range(len(chunks)):
+            cur_src["ids"] = src_chunks[ci]
             h, br = layer(
                 H[ci],
                 ssm_masks[ci] if layer.is_linear else attn_masks[ci],
                 None,
                 BR[ci],
             )
-            mx.eval(h, br if br is not None else h, sal, cnt)
+            mx.eval(h, br if br is not None else h, sal, cnt, sal_s, cnt_s)
             H[ci], BR[ci] = h, br
 
         if layer.is_moe:
             layer.block_sparse_moe.expert_stats_hook = None
             saliency[i] = np.array(sal, copy=True)
             counts[i] = np.array(cnt, copy=True)
+            if labels:
+                per_src[:, i, :] = np.array(sal_s, copy=True).reshape(n_src, NE_)
+                per_src_cnt[:, i, :] = np.array(cnt_s, copy=True).reshape(n_src, NE_)
             nz = int((counts[i] > 0).sum())
             print(f"[reap] layer {i:3d}/{n_layers-1} MoE  {time.time()-lt:6.1f}s  "
                   f"experts routed {nz}/{margs.num_experts}  "
@@ -274,6 +328,13 @@ def calibrate(args):
         num_experts=np.array(margs.num_experts),
         top_k=np.array(margs.num_experts_per_token),
         num_hidden_layers=np.array(margs.num_hidden_layers),
+        per_source=per_src,
+        per_source_counts=per_src_cnt,
+        source_labels=np.array(labels if labels else ["all"]),
+        source_tokens=np.array(
+            [int((source_ids == i).sum()) for i in range(n_src)]
+            if source_ids is not None else [n_tokens]
+        ),
     )
     print(f"[reap] wrote {args.out}  ({(time.time()-t0)/60:.1f} min)")
     return saliency, counts, n_tokens

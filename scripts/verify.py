@@ -122,6 +122,8 @@ def main():
     ap.add_argument("--path", required=True)
     ap.add_argument("--src", default=None, help="source repo, enables numeric spot-check")
     ap.add_argument("--samples", type=int, default=12)
+    ap.add_argument("--plan", default=None,
+                    help="REAP plan, if the artifact predates config['reap']['keep']")
     a = ap.parse_args()
 
     print(f"verifying {a.path}")
@@ -183,16 +185,34 @@ def main():
           f"{len(plain_exp)} full-precision tensors")
 
     # bits/weight from the known 2.78T parameter count
-    KNOWN_PARAMS = 2_779_970_000_000
+    counts = args.expert_counts
+    if counts:
+        n_params = sum(c * 3 * 3584 * 3072 for c in counts) + 57.23e9
+    else:
+        n_params = 2_779_970_000_000
     if actual > 1e11:
-        print(f"        effective {actual * 8 / KNOWN_PARAMS:.3f} bits/weight "
-              f"over {KNOWN_PARAMS / 1e12:.2f}T params")
+        print(f"        effective {actual * 8 / n_params:.3f} bits/weight "
+              f"over {n_params / 1e12:.3f}T params")
 
     # ---- 4. numerics
     if a.src and os.path.exists(a.src):
         print("\n[4] expert numerics vs source")
         src_idx = json.load(open(os.path.join(a.src, "model.safetensors.index.json")))["weight_map"]
+        # Pruning renumbers experts: output index i is source expert keep[i].
+        # Comparing i to i would report cos~0 on a perfectly good artifact.
+        keep = None
+        reap = cfg.get("reap", {})
+        if reap.get("keep"):
+            keep = {int(k): v for k, v in reap["keep"].items()}
+        elif a.plan and os.path.exists(a.plan):
+            pl = json.load(open(a.plan))["layers"]
+            keep = {int(k): sorted(int(e) for e in v["keep"]) for k, v in pl.items()}
+        if reap and keep is None:
+            print("  WARNING: pruned artifact with no keep map (--plan); "
+                  "expert comparison would be meaningless -- skipping")
         moe_layers = [i for i in range(args.num_hidden_layers) if kimi_k3.is_moe_layer(args, i)]
+        if keep is not None:
+            moe_layers = [i for i in moe_layers if i in keep]
         rnd = random.Random(0)
         worst, worst_cos, checked, skipped = 0.0, 1.0, 0, 0
         out_cache = {}
@@ -200,7 +220,9 @@ def main():
             layer = rnd.choice(moe_layers)
             e = rnd.randrange(args.num_experts)
             w, dst = rnd.choice([("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")])
-            sk = f"language_model.model.layers.{layer}.block_sparse_moe.experts.{e}.{w}"
+            src_e = keep[layer][e] if keep else e
+            sk = (f"language_model.model.layers.{layer}.block_sparse_moe"
+                  f".experts.{src_e}.{w}")
             if f"{sk}.weight_packed" not in src_idx:
                 skipped += 1
                 continue
@@ -216,11 +238,21 @@ def main():
             ).astype(mx.float32)
 
             op = f"model.layers.{layer}.block_sparse_moe.switch_mlp.{dst}"
-            shard = os.path.join(a.path, wm[f"{op}.weight"])
-            if shard not in out_cache:
-                out_cache.clear()
-                out_cache[shard] = mx.load(shard)
-            osh = out_cache[shard]
+            # weight / scales / biases for one module can straddle a shard
+            # boundary, so resolve each tensor's own shard rather than assuming
+            # they are co-located.
+            def fetch(key):
+                sh = os.path.join(a.path, wm[key])
+                if sh not in out_cache:
+                    if len(out_cache) > 2:
+                        out_cache.clear()
+                    out_cache[sh] = mx.load(sh)
+                return out_cache[sh][key]
+            osh = {k: fetch(f"{op}.{k}") for k in ("weight", "scales")
+                   if f"{op}.{k}" in wm}
+            if f"{op}.biases" in wm:
+                osh["biases"] = fetch(f"{op}.biases")
+            osh = {f"{op}.{k}": v for k, v in osh.items()}
             kw = {"group_size": quant.get("group_size"), "bits": quant.get("bits"),
                   "mode": quant.get("mode", "affine")}
             if op in quant:
@@ -243,7 +275,7 @@ def main():
             worst = max(worst, err)
             worst_cos = min(worst_cos, cos)
             checked += 1
-            print(f"        L{layer:<3d} e{e:<4d} {w}  max|err| {err:.3e}  "
+            print(f"        L{layer:<3d} e{e:<4d}<-src{src_e:<4d} {w}  max|err| {err:.3e}  "
                   f"mean rel {rel:7.3%}  cos {cos:.5f}")
 
         if checked == 0:
