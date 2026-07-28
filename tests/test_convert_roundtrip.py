@@ -300,6 +300,40 @@ class TestConverterRoundTrip(unittest.TestCase):
             d = float(mx.abs(results[p] - ref).mean())
             print(f"  mean |{p} - mxfp4| = {d:.4f}")
 
+    def test_profiles_are_pairwise_distinct(self):
+        """No two profiles may describe the same quantization.
+
+        `2bit` and `mixed2` were byte-identical: both quantized experts to 2-bit
+        and non-experts to 4-bit, so build_all.sh wrote the same ~880 GB model
+        twice under two names while the README documented them as separate
+        tiers at different bit widths. Nothing structural catches that -- both
+        builds convert, verify and load perfectly -- so it is asserted here.
+        """
+        # the other tests shell out to convert.py; this one needs the specs
+        # themselves, so import it directly.
+        sys.path.insert(0, os.path.join(ROOT, "scripts"))
+        import convert
+        specs = {p: convert.profile_spec(p)
+                 for p in ("mxfp4", "2bit", "3bit", "mixed2")}
+        seen = {}
+        for name, spec in specs.items():
+            key = repr(sorted((k, repr(v)) for k, v in spec.items()))
+            self.assertNotIn(
+                key, seen,
+                f"profiles {seen.get(key)!r} and {name!r} are identical: "
+                f"{spec}. Two names for one tier wastes a full build."
+            )
+            seen[key] = name
+
+        # and the specific distinction that was missing: mixed2 keeps
+        # non-experts at full precision, 2bit does not.
+        self.assertIsNone(specs["mixed2"]["other"],
+                          "mixed2 must leave non-experts bf16")
+        self.assertEqual(specs["2bit"]["other"]["bits"], 4)
+        self.assertEqual(specs["2bit"]["expert"]["bits"],
+                         specs["mixed2"]["expert"]["bits"],
+                         "both are 2-bit-expert tiers; only non-experts differ")
+
     def test_vision_survives_conversion_and_loads(self):
         """Vision tensors must reach the output in bf16 and load into VisionModel.
 

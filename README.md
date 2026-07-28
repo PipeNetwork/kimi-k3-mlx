@@ -144,12 +144,24 @@ to zero error end-to-end. Requantizing those same weights to affine 4-bit costs
 **9.8% mean relative error** and is *larger* (4.5 vs 4.25 bpw), so a plain
 `4bit` tier is strictly dominated and is not built.
 
-| tier | bpw | size | expert error vs source |
-|---|---|---|---|
-| **mxfp4** | 4.25 | ~1.48 TB (+114 GB bf16 rest = 1.56 TB) | **0 — bit-exact** |
-| `3bit` | 3.50 | ~1.22 TB | lossy (2nd quantization pass) |
-| `mixed2` | ~2.9 | ~1.02 TB | experts 2-bit, rest 4-bit |
-| `2bit` | 2.50 | ~0.87 TB | lossy |
+| tier | expert bpw | non-experts | size | expert error vs source |
+|---|---|---|---|---|
+| **mxfp4** | 4.25 | bf16 | 1.56 TB (1.45 TB experts + 115 GB rest) | **0 — bit-exact** |
+| `3bit` | 3.50 | 4-bit | 1.22 TB | lossy (2nd quantization pass) |
+| `mixed2` | 2.50 | **bf16** | 0.97 TB | lossy |
+| `2bit` | 2.50 | 4-bit | 0.88 TB | lossy |
+
+The bpw column is **expert** bits/weight, not the model average — experts are
+97.94% of parameters, so it is the number that moves the size. `mixed2` and
+`2bit` quantize experts identically and differ *only* in what happens to the
+other 2%: `mixed2` leaves them bf16, which costs 83 GB and isolates the question
+"are 2-bit experts survivable when nothing else is degraded?". Both accept
+`--nonexpert-bits` to trade that down.
+
+(Those two profiles were byte-identical until they were separated; the size and
+bpw figures here are recomputed from the parameter table above, which reproduces
+the measured 1.561 TB for `mxfp4` exactly. `tests/test_convert_roundtrip.py`
+now asserts no two profiles describe the same quantization.)
 
 `6bit`, `8bit` and `bf16` are not built: they would store upcast 4-bit values at
 2.26 / 2.95 / 5.56 TB, larger than the source, with zero quality gain.

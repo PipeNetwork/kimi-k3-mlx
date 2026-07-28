@@ -79,10 +79,20 @@ def profile_spec(profile: str, nonexpert_bits: Optional[int] = None) -> Dict[str
             global_q={"mode": "affine", "group_size": 64, "bits": bits},
         )
     if profile == "mixed2":
+        # The "mixed" is 2-bit experts against bf16 everything-else. Non-experts
+        # are 2% of parameters but every token reads all of them, so this tier
+        # isolates the question "are 2-bit experts survivable when nothing else
+        # is degraded?" -- `2bit` answers the cheaper question by taking the
+        # non-experts to 4-bit too. Without this split the two profiles emit
+        # byte-identical models; tests/test_convert_roundtrip.py pins that.
+        other = (
+            None if nonexpert_bits is None
+            else {"mode": "affine", "group_size": 64, "bits": nonexpert_bits}
+        )
         return dict(
             expert={"mode": "affine", "group_size": 64, "bits": 2},
-            other={"mode": "affine", "group_size": 64, "bits": 4},
-            gate={"mode": "affine", "group_size": 64, "bits": 8},
+            other=other,
+            gate=other,
             global_q={"mode": "affine", "group_size": 64, "bits": 2},
         )
     raise SystemExit(f"unknown profile {profile!r}")
