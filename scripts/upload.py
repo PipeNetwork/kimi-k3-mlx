@@ -97,6 +97,24 @@ def model_card(name, d, sm=None):
     per_tok = exp_gb + non_gb
     tok_s = sm["tok_s"] if sm else float("nan")
     load_line = (f"{sm['load_s']} s, {sm['peak_gb']} GB peak" if sm else "not measured")
+    calib_note = ""
+    if "zh-code" in name:
+        calib_note = """ — targeted at Chinese + code
+
+This build is calibrated on **Chinese and code only**, not the full mixed
+corpus. Kimi-K3's experts cluster by domain — measured over a top-242 set
+against a 27% chance baseline, code-python↔code-multi overlap is 57.2% while
+chinese↔code-python is 17.8%, i.e. *below* chance — so dropping the languages
+you do not need frees expert slots for the ones you do. Saliency retained rises
+from 59.1% (mixed) to 69.3% here at identical size.
+
+The tradeoff is real: Japanese, Korean, Russian, Arabic, German, French and
+Spanish are materially degraded relative to the mixed build. Use
+`Kimi-K3-REAP73-MLX-mxfp4-q8` if you need those.
+
+Measured against the mixed build on the same prompts: Chinese improves (the
+mixed build drifts into restating the prompt by ~18 tokens; this one does not),
+and code is unchanged."""
     _looped = any("是一种基于人工智能的学科，是一种" in b for _, b in (sm or {}).get("samples", []))
     cjk_note = ("**Chinese output degrades noticeably in this build** — the sample above "
                 "loops. Prefer the REAP-73 build if you need CJK.\n\n") if _looped else ""
@@ -196,7 +214,7 @@ Two things work in its favour that a plain expert cull would not have: K3 keeps
 LatentMoE applies RMSNorm to the *combined* expert output, which partially
 self-corrects the magnitude lost when experts are removed.
 
-## Calibration
+## Calibration{calib_note}
 
 Saliency was measured on a deliberately mixed 12.6 MB corpus — 40% code
 (multi-language + real Python), 30% English web, 15% Chinese, 15% across

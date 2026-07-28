@@ -154,6 +154,25 @@ to zero error end-to-end. Requantizing those same weights to affine 4-bit costs
 `6bit`, `8bit` and `bf16` are not built: they would store upcast 4-bit values at
 2.26 / 2.95 / 5.56 TB, larger than the source, with zero quality gain.
 
+## Published
+
+| repo | size | experts | calibrated on | tok/s |
+|---|---|---|---|---|
+| [Kimi-K3-REAP73-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-MLX-mxfp4-q8) | 451 GB | 242/896 | mixed (11 sources) | 0.16 |
+| [Kimi-K3-REAP80-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP80-MLX-mxfp4-q8) | 350 GB | 179/896 | mixed | 0.20 |
+| [Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8) | 451 GB | 242/896 | **Chinese + code** | 0.14 |
+
+Surviving experts are bit-exact copies of Moonshot's MXFP4 in every build; the
+only information lost is the pruning itself. `--nonexpert-bits 8` is required,
+not cosmetic: with bf16 non-experts the 242-expert build is 504 GB and is
+OOM-killed during load on a 512 GiB machine.
+
+**None of these are interactive.** 0.14–0.20 tok/s. Each token reads ~87 GB of
+weights, 61 GB of which is non-expert tensors touched every token despite being
+2% of parameters. A 350 GB build with 160 GiB spare measured 0.20 vs 0.16 for
+451 GB — gains track size almost exactly, so this is a bandwidth wall, not an
+allocator problem, and no prune ratio fixes it.
+
 ## Reality check
 
 **No tier is runnable on any Apple Silicon machine.** Peak unified memory tops
@@ -350,20 +369,47 @@ Code, European languages and CJK each form a cluster; code and Chinese are
 holds per-source saliency, so a domain-targeted build needs no second
 calibration — just sum the buckets you want.
 
-**It works, and it cuts both ways.** Three builds, all 451 GB, differing only in
-calibration target:
+**It works, and it cuts both ways.** Five builds, all 451 GB (bar one), differing
+only in calibration target. Same prompts, greedy decoding, 24 tokens:
 
-| build | saliency retained | Chinese prompt | code prompt |
+| build | retained | Chinese | code |
 |---|---|---|---|
-| mixed | 59.1% | good, loops at the end | correct |
-| English+code | 68.4% | **total repetition collapse** | correct |
-| Chinese-only | 79.8% | **best of all four — no loop** | **total repetition collapse** |
+| mixed | 59.1% | good, loops back to the prompt by ~18 tok | correct |
+| REAP-80 (179 experts) | ~50% | hard repetition loop | correct |
+| English+code | 68.4% | **total collapse** | correct |
+| Chinese-only | 79.8% | no loop, but vague | **total collapse** |
+| **Chinese+code** | **69.3%** | **best — correct and specific, no loop** | **correct** |
 
-Prune a domain's experts and that domain dies; keep them and it improves.
-Retention above ~60% is where the improvement becomes visible — the English+code
-build showed no *observable* code gain because the mixed build already retained
-67% of code saliency and the test prompt was too over-determined to separate
-them.
+Prune a domain's experts and that domain dies; keep them and it improves; combine
+two domains and both hold. The expert set determines the capability, and you
+select it by selecting the corpus.
+
+Verbatim on `机器学习的基本原理是` ("the basic principle of machine learning is"):
+
+```
+mixed         ，机器学习是人工智能的核心，是一切计算机视觉化、网络化的基础。
+              机器学习的基本原理是，机器学习是人工智能      <- loops
+English+code  ，机器学习的基本原理是，机器学习的基本原理是，机器学习的基本原理是  <- collapse
+Chinese-only  ：通过计算机模拟人脑的思维，由计算机实现人类对自然的延伸和扩展
+Chinese+code  ：通过训练数据，学习算法，然后对未知数据进行预测。
+              机器学习的过程是：输入数据→学习算法→          <- correct and specific
+```
+
+and on the code prompt, where Chinese-only lost the capability entirely:
+
+```
+mixed / En+code / zh-code    if not intervals: return [] ; intervals.sort(...) ; merged = [...]
+Chinese-only                 """Merge overlapping intervals."   x4          <- collapse
+```
+
+**A caveat on strength of evidence.** This is one prompt per domain, 24 tokens,
+greedy. It is consistent with two independent measurements — expert overlap and
+saliency retention — which is why it is believable, but it is not a rigorous
+eval. A real claim needs many prompts and held-out perplexity per domain. An
+earlier version of this file recorded targeted calibration as a *null* result on
+the strength of a single code prompt so over-determined that every build emits
+identical tokens; that conclusion was wrong, and the same skepticism applies to
+the positive result here.
 
 ## Build
 
