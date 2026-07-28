@@ -194,54 +194,95 @@ different images (a tower ignoring its input would pass every shape check).
 
 | repo | size | experts | calibrated on | tok/s |
 |---|---|---|---|---|
-| [Kimi-K3-REAP73-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-MLX-mxfp4-q8) | 451 GB | 242/896 | mixed (11 sources) | 0.16 |
-| [Kimi-K3-REAP80-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP80-MLX-mxfp4-q8) | 350 GB | 179/896 | mixed | 0.20 |
-| [Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8) | 451 GB | 242/896 | **Chinese + code** | 0.14 |
+| [Kimi-K3-REAP73-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-MLX-mxfp4-q8) | 451 GB | 242/896 | mixed (11 sources) | **5.51** |
+| [Kimi-K3-REAP80-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP80-MLX-mxfp4-q8) | 350 GB | 179/896 | mixed | **5.54** |
+| [Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAP73-zh-code-MLX-mxfp4-q8) | 451 GB | 242/896 | **Chinese + code** | **5.51** |
+| [Kimi-K3-REAPgraded-MLX-mxfp4-q8](https://huggingface.co/pipenetwork/Kimi-K3-REAPgraded-MLX-mxfp4-q8) | 451 GB | 326/896, two-bank | mixed | **2.68** |
 
 Surviving experts are bit-exact copies of Moonshot's MXFP4 in every build; the
 only information lost is the pruning itself. `--nonexpert-bits 8` is required,
 not cosmetic: with bf16 non-experts the 242-expert build is 504 GB and is
 OOM-killed during load on a 512 GiB machine.
 
-**None of these are interactive.** 0.14–0.20 tok/s. Each token reads ~87 GB of
-weights, 61 GB of which is non-expert tensors touched every token despite being
-2% of parameters. A 350 GB build with 160 GiB spare measured 0.20 vs 0.16 for
-451 GB — gains track size almost exactly, so this is a bandwidth wall, not an
-allocator problem, and no prune ratio fixes it.
+**These are interactive.** ~5.5 tok/s on a 512 GiB M3 Ultra — 58% of the 9.5
+tok/s that per-token traffic allows against ~819 GB/s, so bandwidth-bound as
+expected rather than pathological. Each token reads ~87 GB of weights, 61 GB of
+which is non-expert tensors touched every token despite being 2% of parameters.
+Figures are the mean of three prompts × 96 tokens, cross-checked against a
+separate harness; spread within a tier is under 1%.
+
+Two things the numbers say that the earlier text got backwards:
+
+- **Pruning buys memory, not speed.** Per-token traffic depends on `top_k` and
+  non-expert precision, never on how many experts are *stored* — so the 350 GB
+  179-expert build and the 451 GB 242-expert build decode identically. Prune to
+  fit a smaller machine, not to go faster.
+- **The graded two-bank build costs 2.06× decode** (2.68 vs 5.51 at the same
+  footprint). See [REAP expert pruning](#reap-expert-pruning); the per-layer sync
+  that a single-layer microbenchmark measured at 1.16× does not amortise across
+  92 layers.
+
+> **Correction, 2026-07-28.** This table previously read 0.14–0.20 tok/s, and
+> this section described an irreducible bandwidth wall that "no prune ratio
+> fixes". Both were wrong, by roughly 27x. `scripts/smoke.py` hand-rolled its
+> decode loop and so never entered the `wired_limit` context manager that
+> `mlx_lm.stream_generate` applies (`generate.py:714`); the weights were left
+> unwired and every decoded token faulted them back from SSD instead of reading
+> RAM. It survived scrutiny because **prefill is compute-bound and touches each
+> page once** — prompt processing looked healthy at ~73 tok/s throughout while
+> decode ran at 2% of the memory system's capability, and only decode re-reads
+> every weight per token. The "gains track size almost exactly" observation that
+> appeared to confirm the bandwidth theory was really tracking how much
+> page-faulting each build incurred. **Users were never affected:** `generate`,
+> `stream_generate`, the CLI, `BatchGenerator` and `server.py` all wire
+> correctly, so this was only ever wrong in our own measurements. Reported by
+> [@pudepiedj](https://huggingface.co/pudepiedj), who measured 5.608 tok/s on
+> REAP80 against a card claiming 0.20. `scripts/mlxmem.py` now wires to the same
+> limit mlx-lm picks, and any harness reporting tok/s must call it.
 
 ## Reality check
 
-**No tier is runnable on any Apple Silicon machine.** Peak unified memory tops
-out at 512 GB (M3 Ultra Mac Studio); the smallest tier here is 869 GB. Fitting
-4-bit into 512 GB would need ≤1.38 bits/weight.
+**No *unpruned* tier is runnable on any Apple Silicon machine.** Peak unified
+memory tops out at 512 GB (M3 Ultra Mac Studio); the smallest full tier here is
+883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
+[REAP pruning](#reap-expert-pruning) exists to solve — the pruned builds in
+[Published](#published) do fit, and do run.
 
 Consequences, stated plainly:
 
-- These artifacts have **never produced a token.** No perplexity, no generation,
-  no smoke test — that is not a shortcut taken, it is arithmetically impossible
-  on this hardware.
-- What *is* verified: bit-exactness of the mxfp4 tier against the source,
-  100% checkpoint-key coverage over all 497,220 tensors, prefill/decode
+- The **unpruned tiers** have never produced a token. No perplexity, no
+  generation, no smoke test — that is not a shortcut taken, it is arithmetically
+  impossible on this hardware. Every measured number in this file comes from a
+  REAP-pruned build.
+- What *is* verified for them: bit-exactness of the mxfp4 tier against the
+  source, 100% checkpoint-key coverage over all 497,220 tensors, prefill/decode
   agreement of the architecture at small scale, and per-expert cosine similarity
   against the source for the lossy tiers. See [Verification](#verification).
-- The 2-bit tiers are a **double quantization** on top of Moonshot's MXFP4.
-  Quality there is genuinely unknown and could be poor; `mixed2` exists because
-  that is how the Laguna 2-bit tier stayed coherent.
+- The 2-bit tiers are a **double quantization** on top of Moonshot's MXFP4, and
+  it costs real quality. This is now measured rather than guessed: a REAP73
+  build with 2-bit experts is 262 GB, small enough to run with room to spare,
+  and scores **17.03** held-out perplexity while looping on Chinese and French
+  prompts where the mxfp4-expert graded build does not. `mixed2` keeps
+  non-experts at bf16 for exactly this reason.
 
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers kimi_k3.py, runs all 39 tests
+scripts/test_all.sh                     # registers kimi_k3.py, runs all 76 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
+scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
+    --skip-tokens <past the calibration prefix> --out out/ppl.npz
 ```
 
 | suite | what it covers | |
 |---|---|---|
-| `test_kimi_k3.py` | architecture + 497,220-key coverage | 13 |
-| `test_vision_parity.py` | vision tower vs torch reference | 9 |
+| `test_prune_apply.py` | REAP plan application + router renumbering | 18 |
+| `test_kimi_k3.py` | architecture + 497,220-key coverage | 17 |
 | `test_vl_wrapper.py` | placeholder expansion + multimodal path | 11 |
-| `test_convert_roundtrip.py` | converter, on a synthetic mini-K3 | 3 |
-| `test_processor_integration.py` | real processor -> MLX tower | 3 |
+| `test_reap.py` | saliency accumulation and planning modes | 10 |
+| `test_vision_parity.py` | vision tower vs torch reference | 9 |
+| `test_processor_integration.py` | real processor -> MLX tower | 7 |
+| `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 4 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -337,19 +378,40 @@ The naive two-bank forward costs 2× expert compute — run both banks over ever
 routed pair and select. Instead it exploits the sort `SwitchGLU` already
 performs: once (token, slot) pairs are sorted by expert index, a bank owning a
 contiguous index range owns a contiguous *slice*, so each bank does exactly its
-own share. Measured at K3 REAP dims (3584→3072, 240 experts, top-16):
+own share. Isolated at K3 REAP dims (3584→3072, 240 experts, top-16), one layer:
 
 | | vs single-bank |
 |---|---|
-| prefill (256 tok) | **1.05×** |
-| decode (1 tok) | **1.16×** |
+| prefill (256 tok) | 1.05× |
+| decode (1 tok) | 1.16× |
 | memory, same expert count | **82%** |
 
 The split point is data-dependent, so it must reach the host to slice on — and
 that sync is essentially the entire overhead. Decode routes only `top_k` pairs,
 too few to amortise two kernel launches plus a device sync, so below 1024 pairs
 the indices come down in one transfer and partition with numpy. That alone took
-decode from 1.44× to 1.16×.
+the single-layer decode figure from 1.44× to 1.16×.
+
+**That microbenchmark does not survive contact with the real model.** Measured
+end to end on the published builds, all at ~450 GB and all wired:
+
+| build | experts | tok/s |
+|---|---|---|
+| REAP73 single-bank | 242 | **5.51** |
+| REAPgraded two-bank | 326 | **2.68** |
+
+A **2.06× decode penalty** — essentially the full cost of the run-both-and-select
+scheme this design exists to avoid. The single-layer 1.16× is real but
+misleading: the overhead is a per-layer host sync, and K3 has 92 MoE layers, so
+what amortises within one layer's kernel launch does not amortise across 92 of
+them serialised down the decode critical path. Graded should if anything be
+*faster* — part of its routed experts are 2-bit rather than mxfp4, so it moves
+less memory per token — which places the entire 2.06× on the two-bank machinery.
+
+The honest summary: graded buys ~35% more experts and measurably better Chinese
+for **half the decode speed**. Whether that trade is worth taking depends
+entirely on the workload, and the microbenchmark above should not be read as
+predicting the cost.
 
 Correctness rests on one test: give both banks the *same* weights and precision
 and the result must match a plain `SwitchGLU` **exactly** (it does, bit-for-bit,
@@ -447,6 +509,72 @@ the strength of a single code prompt so over-determined that every build emits
 identical tokens; that conclusion was wrong, and the same skepticism applies to
 the positive result here.
 
+That caveat is now partly discharged: `scripts/perplexity.py` scores a build on
+held-out text bucketed by source corpus, which is the rigorous version of the
+eval this section asks for. It requires `--skip-tokens` rather than defaulting
+it, because `reap_calibrate.py` consumes the *first* `seqs × seqlen` tokens of
+the corpus and scoring from offset 0 grades every build on the data its own plan
+was fitted to.
+
+## AWQ on the 2-bit experts — measured
+
+`scripts/awq.py`. K3 makes AWQ unusually cheap: LatentMoE routes every expert in
+a layer through the **same** 3584-d latent, so one scale vector per layer covers
+all 896 experts — 1.3 MB, against the 1.2 GB a per-expert table would need — and
+the inverse folds exactly into `routed_expert_down_proj`:
+
+```
+w1' = w1 · s        w3' = w3 · s        down_proj' = down_proj / s
+```
+
+`alpha` is grid-searched per layer against activation-weighted reconstruction
+error, which is what makes this calibrated rather than a heuristic. Held-out
+perplexity over 65,504 tokens against an otherwise byte-identical build:
+
+| | perplexity |
+|---|---|
+| 2-bit experts, no AWQ | 17.0288 |
+| 2-bit experts + AWQ | **16.6573** — −2.18%, 95% CI [−4.56%, −0.34%] |
+
+**The aggregate is a poor summary of what happened.** AWQ does not shift the
+typical token: the median per-token NLL delta is −0.0001 nats and only 51% of
+tokens improve at all. It *redistributes*, sorted by how hard the control found
+each token:
+
+| control NLL band | tokens | mean Δ (nats) |
+|---|---|---|
+| below median | 32,752 | **+0.0403 — AWQ worse** |
+| median–p90 | 26,201 | −0.0359 |
+| p90–p99 | 5,895 | −0.2442 |
+| top 0.1% | 65 | −0.9426 |
+
+That is the mechanism AWQ advertises — protect the channels carrying the
+activation — showing up as **tail repair rather than a mean shift**. It buys hard
+tokens by spending easy ones. The net is 13,795 nats gained against 12,350 lost,
+a 1.12:1 residue of two much larger opposing effects, which is why it is
+fragile: dropping the three most favourable sequences takes −2.18% to −0.76%.
+
+It is also domain-skewed, and the skew tracks the calibration corpus. Chinese was
+36.4% of the AWQ calibration set and improves 5.7%; Arabic was 1.3% and regresses
+6.6%, Spanish 1.4%, Japanese 2.0%, all with CIs excluding zero. One scale vector
+per layer cannot be optimal for every domain at once — the same lesson the
+calibration section above records for pruning, arriving by another route.
+`scripts/make_balanced_calib.py` exists to remove that confound: it re-samples an
+existing corpus to equal token counts per source, round-robined by document so
+sequences stay mixed, and takes `--skip-tokens` to stay clear of held-out
+regions.
+
+Two things worth knowing before reaching for this:
+
+- The weight-space probe **underestimated the effect by an order of magnitude**.
+  Activation-weighted reconstruction error at the chosen alpha beats alpha=0 by
+  only 0.18%, because it averages uniformly and is blind to a change that wrecks
+  easy tokens while rescuing hard ones.
+- AWQ is **incompatible with a graded plan** and `convert.py` refuses the
+  combination. The fold divides `down_proj` by `s` once per layer, but the graded
+  hi bank is passed through unscaled to stay bit-exact, so those experts would
+  read `latent/s`. At `s ≈ 1 ± 5%` that degrades quietly rather than failing.
+
 ## Build
 
 ```bash
@@ -482,12 +610,16 @@ PY
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 39/39 tests passing
-- [ ] source download (1.56 TB, in progress)
-- [ ] real conversions
+- [x] 76/76 tests passing
+- [x] source download (1.56 TB)
+- [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
       validated against the real processor end to end
-- [x] publish to `pipenetwork/` (3 tiers)
+- [x] publish to `pipenetwork/` (4 tiers)
+- [x] **held-out perplexity** (`scripts/perplexity.py`), bucketed per source
+- [x] AWQ implemented and measured — [small, fragile, domain-skewed](#awq-on-the-2-bit-experts--measured)
+- [ ] AWQ re-run on a balanced calibration corpus (in progress)
+- [ ] tok/s re-measured for all published tiers after the wiring fix
 
 ## Provenance and licensing
 

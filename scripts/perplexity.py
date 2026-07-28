@@ -94,6 +94,12 @@ def main():
 
     from mlx_lm.utils import load_model
     from reap_calibrate import build_tokenizer
+    import mlxmem
+
+    # Perplexity itself is unaffected by wiring -- it is prefill-only and the
+    # arithmetic is identical either way -- but wiring cuts the wall time
+    # substantially, and it keeps every model-loading script on one path.
+    mlxmem.wire()
 
     tok_src = a.path if os.path.exists(os.path.join(a.path, "tiktoken.model")) else a.src
     enc = build_tokenizer(tok_src)

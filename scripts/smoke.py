@@ -30,6 +30,11 @@ def main():
 
     from mlx_lm.utils import load_model
     from reap_calibrate import build_tokenizer
+    import mlxmem
+
+    # Must precede load_model: an unwired model faults its weights from SSD on
+    # every decode step and reports ~1/27th of its real tok/s.
+    mlxmem.wire()
 
     tok_src = a.path if os.path.exists(os.path.join(a.path, "tiktoken.model")) else a.src
     enc = build_tokenizer(tok_src)

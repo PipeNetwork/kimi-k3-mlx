@@ -52,6 +52,17 @@ def parse_smoke(path):
         return None
     txt = open(path, encoding="utf-8", errors="replace").read()
     import re
+    loads = re.findall(r"loaded in (\d+)s\s*\|\s*peak mem (\d+) GB", txt)
+    if len(loads) > 1:
+        # An A/B log holds several runs back to back. Taking the first `loaded
+        # in` line and averaging every tok/s across all of them silently
+        # attributes one model's samples, load time and speed to another -- it
+        # put three q4n generations on the published REAPgraded card. Refuse.
+        raise SystemExit(
+            f"{path} contains {len(loads)} model loads; a smoke log must cover "
+            f"exactly one build or the card mixes them. Re-run scripts/smoke.py "
+            f"for this build alone and pass that log."
+        )
     load = re.search(r"loaded in (\d+)s\s*\|\s*peak mem (\d+) GB", txt)
     rates = [float(m) for m in re.findall(r"= ([\d.]+) tok/s", txt)]
     blocks = []
@@ -84,7 +95,7 @@ prompt: 机器学习的基本原理是
 --> ，机器学习是人工智能的核心，是一切计算机视觉化、网络化的基础。'''
 
 
-def model_card(name, d, sm=None):
+def model_card(name, d, sm=None, prev_tok_s=None):
     kept, src = d["kept"], d["src_experts"]
     pct_pruned = round((1 - kept / src) * 100)
     gb = d["size"] / 1e9
@@ -97,6 +108,24 @@ def model_card(name, d, sm=None):
     per_tok = exp_gb + non_gb
     tok_s = sm["tok_s"] if sm else float("nan")
     load_line = (f"{sm['load_s']} s, {sm['peak_gb']} GB peak" if sm else "not measured")
+    # ~819 GB/s is the M3 Ultra's peak memory bandwidth; per_tok is what one
+    # decoded token must read, so their ratio is the hard ceiling for this build.
+    ceiling = 819.0 / per_tok
+    pct_of_ceiling = tok_s / ceiling * 100 if tok_s == tok_s else float("nan")
+    correction = ""
+    if prev_tok_s:
+        correction = f"""
+> **Correction, 2026-07-28.** Earlier revisions of this card reported
+> ~{prev_tok_s:.2f} tok/s and described this build as "not interactive". That number
+> came from an internal benchmark that hand-rolled its own decode loop and so
+> never entered the `wired_limit` context manager `mlx_lm.stream_generate`
+> applies automatically. The weights were left unwired, and every decoded token
+> faulted them back from SSD instead of reading RAM -- understating this build by
+> roughly {tok_s / prev_tok_s:.0f}x. **Users were never affected:** the normal mlx-lm
+> paths (`generate`, `stream_generate`, the CLI, the server) have always wired
+> correctly, so what you measure is the corrected figure above. Thanks to
+> [@pudepiedj](https://huggingface.co/pudepiedj) for reporting the discrepancy.
+"""
     calib_note = ""
     graded = bool((d["tc"] or {}).get("expert_bank_split"))
     if graded:
@@ -113,12 +142,24 @@ each instead of 4.25.
 MLX pins one bit width per expert tensor, so this needs a custom
 `TwoBankSwitchGLU` (bundled in `kimi_k3.py`). It exploits the sort SwitchGLU
 already performs: once routed pairs are sorted by expert index, each bank owns a
-contiguous slice, so neither bank does the other's work. Measured overhead is
-1.05x prefill / 1.16x decode, not the 2x a run-both-and-select scheme costs.
+contiguous slice, so neither bank does the other's work.
 
 Saliency retained rises to **68.4%** from 59.1% for a uniform 242-expert build at
 the same size, and Chinese output is measurably better (the uniform build drifts
-back into restating the prompt; this one does not)."""
+back into restating the prompt; this one does not).
+
+**It costs half the decode speed.** Measured end to end against the otherwise
+comparable single-bank build at the same 450 GB footprint: **2.68 tok/s here
+versus 5.51** for `Kimi-K3-REAP73-MLX-mxfp4-q8` -- a 2.06x penalty, which is
+essentially the full cost of the run-both-and-select scheme the two-bank design
+exists to avoid. The overhead is a per-layer host sync to find the data-dependent
+split point, and K3 has 92 MoE layers serialised down the decode path; what
+amortises inside a single layer does not amortise across 92. This build moves
+*less* memory per token than the single-bank one (part of its experts are 2-bit),
+so the penalty is entirely machinery, not bandwidth.
+
+Take this build if you want the extra experts and better Chinese and can accept
+half the speed. Take `Kimi-K3-REAP73-MLX-mxfp4-q8` otherwise."""
     if "zh-code" in name:
         calib_note = """ — targeted at Chinese + code
 
@@ -210,18 +251,26 @@ which matches the calibration data: code experts form a dense, self-similar
 cluster (57% self-overlap in a top-242 set, versus a 27% chance baseline) and so
 survive pruning better than more diffuse language capability.
 
-## Speed — read this before downloading
+## Speed
 
-**~{tok_s:.2f} tok/s** on a 512 GiB M3 Ultra. Not a typo, and not interactive.
+**~{tok_s:.2f} tok/s** decoding on a 512 GiB M3 Ultra, via `mlx_lm.generate` or
+any standard mlx-lm entry point. Prompt processing is considerably faster; the
+figure above is generation.
 
 Each decoded token reads roughly {per_tok:.0f} GB of weights: {exp_gb:.1f} GB of routed
-experts plus {non_gb:.1f} GB of non-expert weights, which every token touches. This is a
-bandwidth wall, not a headroom problem -- a 350 GB build with 160 GiB of spare
-memory measured 0.20 tok/s versus 0.16 for a 451 GB build, i.e. gains track size
-almost exactly. No prune ratio makes K3 interactive on this hardware.
+experts plus {non_gb:.1f} GB of non-expert tensors, which every token touches. Against
+the M3 Ultra's ~819 GB/s that puts the ceiling near {ceiling:.1f} tok/s, so this build
+reaches about {pct_of_ceiling:.0f}% of what the memory system permits. It is
+bandwidth-bound, which is the expected regime for a model of this shape.
 
 Note the non-experts dominate per-token traffic despite being ~2% of parameters:
 all of them are read every token, while only {top_k} of {kept} experts are.
+
+**Pruning buys memory, not speed.** Per-token traffic depends on `top_k` and the
+non-expert precision, never on how many experts are *stored*, so the 350 GB
+179-expert build and the 451 GB 242-expert build both decode at ~5.5 tok/s. Prune
+harder to fit a smaller machine, not to go faster.
+{correction}
 
 ## Quality expectations — read this
 
@@ -288,12 +337,16 @@ def main():
                          "go in the card")
     ap.add_argument("--readme-only", action="store_true",
                     help="regenerate and push just the model card")
+    ap.add_argument("--prev-tok-s", type=float, default=None,
+                    help="tok/s a previous revision of this card published; adds "
+                         "a correction note. Use when republishing a number that "
+                         "was wrong, so the change is visible rather than silent")
     ap.add_argument("--dry-run", action="store_true")
     a = ap.parse_args()
 
     name = a.name or os.path.basename(a.path.rstrip("/"))
     d = collect(a.path, a.plan, a.report)
-    card = model_card(name, d, parse_smoke(a.smoke_log))
+    card = model_card(name, d, parse_smoke(a.smoke_log), a.prev_tok_s)
     with open(os.path.join(a.path, "README.md"), "w") as f:
         f.write(card)
     print(f"wrote model card -> {a.path}/README.md")
