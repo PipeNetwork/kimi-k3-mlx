@@ -328,6 +328,43 @@ it also means `‖e_j(x)‖` measures something partly cancelled — the criteri
 want reformulating as relative contribution. Two shared experts fire on every
 token regardless and survive any pruning, giving a floor nothing touches.
 
+## Experts cluster by domain — measured
+
+`scripts/reap_calibrate.py` tags every calibration token by source corpus and
+accumulates saliency per language in one pass (a single fused `(source, expert)`
+scatter). `scripts/reap_overlap.py` then compares the top-N expert sets.
+
+Two random top-242 picks from 896 experts overlap **27%** by chance. Against
+that baseline:
+
+| pair | overlap | vs chance |
+|---|---|---|
+| code-python ↔ code-multi | 57.2% | 2.1× |
+| lang-de ↔ lang-es | 59.3% | 2.2× |
+| lang-de ↔ web-en | 56.5% | 2.1× |
+| chinese ↔ lang-ja | 42.8% | 1.6× |
+| **chinese ↔ code-python** | **17.8%** | **0.66× — below chance** |
+
+Code, European languages and CJK each form a cluster; code and Chinese are
+*anti*-correlated. `scripts/reap_subset.py` exploits this: a tagged run already
+holds per-source saliency, so a domain-targeted build needs no second
+calibration — just sum the buckets you want.
+
+**It works, and it cuts both ways.** Three builds, all 451 GB, differing only in
+calibration target:
+
+| build | saliency retained | Chinese prompt | code prompt |
+|---|---|---|---|
+| mixed | 59.1% | good, loops at the end | correct |
+| English+code | 68.4% | **total repetition collapse** | correct |
+| Chinese-only | 79.8% | **best of all four — no loop** | **total repetition collapse** |
+
+Prune a domain's experts and that domain dies; keep them and it improves.
+Retention above ~60% is where the improvement becomes visible — the English+code
+build showed no *observable* code gain because the mixed build already retained
+67% of code saliency and the test prompt was too over-determined to separate
+them.
+
 ## Build
 
 ```bash
