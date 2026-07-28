@@ -98,6 +98,27 @@ def model_card(name, d, sm=None):
     tok_s = sm["tok_s"] if sm else float("nan")
     load_line = (f"{sm['load_s']} s, {sm['peak_gb']} GB peak" if sm else "not measured")
     calib_note = ""
+    graded = bool((d["tc"] or {}).get("expert_bank_split"))
+    if graded:
+        bs = [x for x in d["tc"]["expert_bank_split"] if x]
+        nhi = bs[0]
+        calib_note = f""" — graded two-bank precision
+
+Experts are split across **two banks at different bit widths**: the {nhi} most
+salient per layer at **mxfp4** (bit-exact copies of Moonshot's weights) and the
+remainder at 2-bit. That fits **{kept} experts per layer instead of 242** at the
+same footprint — 35% more — because the least salient two thirds cost 2.5 bits
+each instead of 4.25.
+
+MLX pins one bit width per expert tensor, so this needs a custom
+`TwoBankSwitchGLU` (bundled in `kimi_k3.py`). It exploits the sort SwitchGLU
+already performs: once routed pairs are sorted by expert index, each bank owns a
+contiguous slice, so neither bank does the other's work. Measured overhead is
+1.05x prefill / 1.16x decode, not the 2x a run-both-and-select scheme costs.
+
+Saliency retained rises to **68.4%** from 59.1% for a uniform 242-expert build at
+the same size, and Chinese output is measurably better (the uniform build drifts
+back into restating the prompt; this one does not)."""
     if "zh-code" in name:
         calib_note = """ — targeted at Chinese + code
 

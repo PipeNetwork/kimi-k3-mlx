@@ -254,6 +254,13 @@ def calibrate(args):
     # per-source saliency: (source, layer, expert). 12 x 93 x 896 float64 = 8 MB.
     per_src = np.zeros((n_src, margs.num_hidden_layers, margs.num_experts), np.float64)
     per_src_cnt = np.zeros((n_src, margs.num_hidden_layers, margs.num_experts), np.float64)
+    # AWQ input statistic: mean |x| per input channel of the shared MoE latent.
+    # K3's LatentMoE routes every expert in a layer through the SAME 3584-d
+    # latent, so one vector per layer covers all 896 experts -- 1.3 MB instead of
+    # the 1.2 GB a per-expert table would need.
+    lat_dim = margs.routed_expert_hidden_size or margs.hidden_size
+    act_mag = np.zeros((margs.num_hidden_layers, lat_dim), np.float64)
+    act_n = np.zeros((margs.num_hidden_layers,), np.float64)
 
     t0 = time.time()
     for i in range(n_layers):
@@ -266,6 +273,8 @@ def calibrate(args):
         sal_s = mx.zeros((n_src * NE_,), mx.float32)
         cnt_s = mx.zeros((n_src * NE_,), mx.float32)
         cur_src = {"ids": None}
+        amag = mx.zeros((margs.routed_expert_hidden_size or margs.hidden_size,), mx.float32)
+        an = [0]
 
         if layer.is_moe:
             def hook(inds, weights, y):
@@ -285,6 +294,12 @@ def calibrate(args):
                     sal_s = sal_s.at[comb].add(contrib)
                     cnt_s = cnt_s.at[comb].add(mx.ones_like(contrib))
 
+            def latent_hook(x, _l=layer):
+                nonlocal amag
+                amag = amag + mx.sum(mx.abs(x.astype(mx.float32)).reshape(-1, x.shape[-1]), axis=0)
+                an[0] += x.size // x.shape[-1]
+
+            layer.block_sparse_moe.latent_stats_hook = latent_hook
             layer.block_sparse_moe.expert_stats_hook = hook
 
         for ci in range(len(chunks)):
@@ -300,6 +315,9 @@ def calibrate(args):
 
         if layer.is_moe:
             layer.block_sparse_moe.expert_stats_hook = None
+            layer.block_sparse_moe.latent_stats_hook = None
+            act_mag[i] = np.array(amag, copy=True)
+            act_n[i] = an[0]
             saliency[i] = np.array(sal, copy=True)
             counts[i] = np.array(cnt, copy=True)
             if labels:
@@ -331,6 +349,7 @@ def calibrate(args):
         per_source=per_src,
         per_source_counts=per_src_cnt,
         source_labels=np.array(labels if labels else ["all"]),
+        act_mag=act_mag, act_n=act_n,
         source_tokens=np.array(
             [int((source_ids == i).sum()) for i in range(n_src)]
             if source_ids is not None else [n_tokens]

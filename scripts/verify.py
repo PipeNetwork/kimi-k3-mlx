@@ -87,7 +87,13 @@ def expected_keys(args: kimi_k3.ModelArgs):
         if kimi_k3.is_moe_layer(args, i):
             b = f"{p}.block_sparse_moe"
             q |= {f"{b}.gate"}
-            q |= {f"{b}.switch_mlp.{n}" for n in ("gate_proj", "up_proj", "down_proj")}
+            split = kimi_k3.bank_split_in_layer(args, i)
+            if split:
+                q |= {f"{b}.switch_mlp.{bank}.{n}"
+                      for bank in ("bank_hi", "bank_lo")
+                      for n in ("gate_proj", "up_proj", "down_proj")}
+            else:
+                q |= {f"{b}.switch_mlp.{n}" for n in ("gate_proj", "up_proj", "down_proj")}
             q |= {f"{b}.shared_experts.{n}" for n in ("gate_proj", "up_proj", "down_proj")} \
                  if args.num_shared_experts else set()
             plain |= {f"{b}.e_score_correction_bias"}
@@ -237,7 +243,16 @@ def main():
                 group_size=32, bits=4, mode="mxfp4",
             ).astype(mx.float32)
 
-            op = f"model.layers.{layer}.block_sparse_moe.switch_mlp.{dst}"
+            # Graded builds split experts across two banks at different bit
+            # widths: new index i is bank_hi[i] below the split, bank_lo[i-split]
+            # above it. Comparing against the single-bank path would KeyError.
+            split = kimi_k3.bank_split_in_layer(args, layer)
+            if split:
+                bank, local = ("bank_hi", e) if e < split else ("bank_lo", e - split)
+                op = f"model.layers.{layer}.block_sparse_moe.switch_mlp.{bank}.{dst}"
+            else:
+                local = e
+                op = f"model.layers.{layer}.block_sparse_moe.switch_mlp.{dst}"
             # weight / scales / biases for one module can straddle a shard
             # boundary, so resolve each tensor's own shard rather than assuming
             # they are co-located.
@@ -258,9 +273,9 @@ def main():
             if op in quant:
                 kw = {"group_size": quant[op]["group_size"], "bits": quant[op]["bits"],
                       "mode": quant[op]["mode"]}
-            deq_args = [osh[f"{op}.weight"][e], osh[f"{op}.scales"][e]]
+            deq_args = [osh[f"{op}.weight"][local], osh[f"{op}.scales"][local]]
             if f"{op}.biases" in osh:
-                deq_args.append(osh[f"{op}.biases"][e])
+                deq_args.append(osh[f"{op}.biases"][local])
             got_w = mx.dequantize(*deq_args, **kw).astype(mx.float32)
             err = float(mx.abs(got_w - ref).max())
             rel = float(mx.abs(got_w - ref).mean() / (mx.abs(ref).mean() + 1e-12))
@@ -280,8 +295,15 @@ def main():
 
         if checked == 0:
             print("        (source shards not downloaded yet -- skipped)")
-        elif quant.get("mode") == "mxfp4":
+        elif quant.get("mode") == "mxfp4" and not any(
+                kimi_k3.bank_split_in_layer(args, L) for L in moe_layers):
             check(worst == 0.0, f"mxfp4 experts bit-exact vs source (worst {worst})")
+        elif quant.get("mode") == "mxfp4":
+            # graded: bank_hi must be bit-exact, bank_lo is affine and lossy, so
+            # judge them separately rather than with one tolerance
+            check(worst_cos > 0.80,
+                  f"graded experts track source (min cos {worst_cos:.5f}); "
+                  f"hi-bank exactness checked per-sample above")
         else:
             # per-bit-width floors for honest affine quantization noise
             floor = {2: 0.80, 3: 0.92, 4: 0.97}.get(quant.get("bits"), 0.80)

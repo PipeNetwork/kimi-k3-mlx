@@ -623,6 +623,9 @@ class KimiSparseMoE(nn.Module):
         # attributes out of parameters()/children(), so this never touches
         # quantization, saving or loading.
         self.expert_stats_hook = None
+        # AWQ input statistic tap: sees the shared MoE latent that every expert
+        # in this layer consumes. None in normal use.
+        self.latent_stats_hook = None
 
     def __call__(self, x: mx.array) -> mx.array:
         identity = x
@@ -637,6 +640,8 @@ class KimiSparseMoE(nn.Module):
             self.args.moe_router_activation_func,
         )
         y = self.routed_expert_down_proj(x) if self.use_latent else x
+        if self.latent_stats_hook is not None:
+            self.latent_stats_hook(y)
         y = self.switch_mlp(y, inds)
         if self.expert_stats_hook is not None:
             # y here is the per-expert output BEFORE gate weighting, shape

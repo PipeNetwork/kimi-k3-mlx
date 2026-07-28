@@ -234,9 +234,17 @@ def expert_stack_passthrough(
 
 
 def expert_stack_requant(
-    reader: ShardReader, layer: int, w: str, n_experts, spec: Dict, keep=None
+    reader: ShardReader, layer: int, w: str, n_experts, spec: Dict, keep=None,
+    awq_scale=None
 ) -> Dict[str, mx.array]:
-    """MXFP4 -> bf16 -> affine N-bit, one expert at a time (bounded memory)."""
+    """MXFP4 -> bf16 -> affine N-bit, one expert at a time (bounded memory).
+
+    With `awq_scale` (a per-input-channel vector for this layer's shared latent),
+    w1/w3 are scaled before quantizing; the inverse is folded into
+    routed_expert_down_proj by the caller, so the product is unchanged and only
+    the quantization error moves. w2 reads the per-expert intermediate, not the
+    shared latent, so it is left alone.
+    """
     base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
     order = keep if keep is not None else range(n_experts)
     qs, ss, bs = [], [], []
@@ -244,6 +252,8 @@ def expert_stack_requant(
         packed = reader.get(f"{base}.{e}.{w}.weight_packed").view(mx.uint32)
         scale = reader.get(f"{base}.{e}.{w}.weight_scale")
         dense = mx.dequantize(packed, scale, group_size=FP4_GROUP, bits=4, mode="mxfp4")
+        if awq_scale is not None and w in ("w1", "w3"):
+            dense = dense * awq_scale
         q, s, b = mx.quantize(
             dense, group_size=spec["group_size"], bits=spec["bits"], mode=spec["mode"]
         )
@@ -326,12 +336,33 @@ def convert(
     limit_layers: Optional[int] = None,
     prune_plan: Optional[str] = None,
     nonexpert_bits: Optional[int] = None,
+    awq_scales: Optional[str] = None,
 ):
     spec = profile_spec(profile, nonexpert_bits)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
     args = kimi_k3.ModelArgs.from_dict(raw_cfg)
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+    awq = None
+    if awq_scales:
+        _z = __import__("numpy").load(awq_scales)
+        awq = mx.array(_z["scales"])
+        print(f"[{profile}] AWQ: per-layer input scales, alpha mean "
+              f"{float(_z['alpha'].mean()):.2f}")
     keep_map, bank_map = load_prune_plan(prune_plan, args)
+    if awq is not None and bank_map:
+        # AWQ is an identity only if EVERY consumer of the latent is scaled: the
+        # down_proj is divided by s once per layer, so an expert whose w1/w3 was
+        # not multiplied by s silently reads latent/s. The graded hi bank is a
+        # byte copy of the source MXFP4 -- scaling it would destroy the
+        # bit-exactness that is its entire reason to exist. So the two are
+        # mutually exclusive, and s ~ 1 +/- 5% means the corruption would degrade
+        # quietly rather than fail loudly. Refuse instead.
+        raise SystemExit(
+            "--awq-scales cannot be combined with a graded (two-bank) plan: the "
+            "mxfp4 hi bank is passed through unscaled, so folding 1/s into "
+            "down_proj would break the identity for exactly those experts. Use a "
+            "uniform lossy profile (2bit/mixed2) for AWQ."
+        )
     expert_counts = bank_splits = None
     if keep_map is not None:
         if bank_map and any(bank_map.values()):
@@ -399,6 +430,15 @@ def convert(
                 assert key in mapped, f"router tensor {key} missing; cannot renumber"
                 mapped[key] = mx.take(mapped[key], sel, axis=0)
 
+        if awq is not None and kimi_k3.is_moe_layer(args, i):
+            dk = f"model.layers.{i}.block_sparse_moe.routed_expert_down_proj.weight"
+            if dk in mapped:
+                # down_proj: (latent, hidden). Its row j produces latent channel
+                # j, which is exactly the channel w1/w3 scaled by s_j -- so
+                # dividing row j by s_j makes the pair an exact identity.
+                mapped[dk] = (mapped[dk].astype(mx.float32)
+                              / awq[i].reshape(-1, 1)).astype(mx.bfloat16)
+
         for key, val in mapped.items():
             assert key.endswith(".weight") or key.endswith((".proj_weight", ".norm_weight", ".A_log", ".dt_bias", ".e_score_correction_bias")), key
             if key.endswith(".weight"):
@@ -424,7 +464,8 @@ def convert(
                     if es["mode"] == "mxfp4":
                         t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
                     else:
-                        t = expert_stack_requant(reader, i, w, args.num_experts, es, keep)
+                        t = expert_stack_requant(reader, i, w, args.num_experts, es,
+                                                 keep, awq[i] if awq is not None else None)
                     emit(f"{moe}.{dst}", t)
                     if es != spec["global_q"]:
                         overrides[f"{moe}.{dst}"] = dict(es)
@@ -438,7 +479,8 @@ def convert(
                     hi_t = expert_stack_passthrough(reader, i, w, args.num_experts,
                                                     keep[:n_hi])
                     lo_t = expert_stack_requant(reader, i, w, args.num_experts,
-                                                lo_spec, keep[n_hi:])
+                                                lo_spec, keep[n_hi:],
+                                                awq[i] if awq is not None else None)
                     emit(f"{moe}.bank_hi.{dst}", hi_t)
                     emit(f"{moe}.bank_lo.{dst}", lo_t)
                     overrides[f"{moe}.bank_hi.{dst}"] = {
@@ -543,8 +585,11 @@ if __name__ == "__main__":
     ap.add_argument("--nonexpert-bits", type=int, default=None,
                     help="quantize non-expert tensors to N bits (mxfp4 profile "
                          "keeps them bf16 by default: 114 GB on K3)")
+    ap.add_argument("--awq-scales", default=None,
+                    help="npz from scripts/awq.py; scales w1/w3 input channels "
+                         "and folds the inverse into routed_expert_down_proj")
     ap.add_argument("--prune-plan", default=None,
                     help="REAP plan from scripts/reap_plan.py; prunes experts "
                          "and renumbers the router to match")
     a = ap.parse_args()
-    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan, a.nonexpert_bits)
+    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan, a.nonexpert_bits, a.awq_scales)
