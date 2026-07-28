@@ -253,7 +253,11 @@ def expert_stack_requant(
         scale = reader.get(f"{base}.{e}.{w}.weight_scale")
         dense = mx.dequantize(packed, scale, group_size=FP4_GROUP, bits=4, mode="mxfp4")
         if awq_scale is not None and w in ("w1", "w3"):
-            dense = dense * awq_scale
+            # Cast back: awq_scale is float32, so the product promotes, and
+            # mx.quantize then emits float32 scales/biases instead of bf16 --
+            # 31 GB of pure padding on K3, and it silently makes an AWQ build
+            # look slower than its control in a bandwidth-bound smoke test.
+            dense = (dense * awq_scale).astype(dense.dtype)
         q, s, b = mx.quantize(
             dense, group_size=spec["group_size"], bits=spec["bits"], mode=spec["mode"]
         )
@@ -349,7 +353,9 @@ def convert(
         print(f"[{profile}] AWQ: per-layer input scales, alpha mean "
               f"{float(_z['alpha'].mean()):.2f}")
     keep_map, bank_map = load_prune_plan(prune_plan, args)
-    if awq is not None and bank_map:
+    # `bank_map` holds an entry per layer with None for the ungraded ones, so it
+    # is truthy for ANY plan -- the banks are in its values, not its keys.
+    if awq is not None and bank_map and any(bank_map.values()):
         # AWQ is an identity only if EVERY consumer of the latent is scaled: the
         # down_proj is divided by s once per layer, so an expert whose w1/w3 was
         # not multiplied by s silently reads latent/s. The graded hi bank is a
