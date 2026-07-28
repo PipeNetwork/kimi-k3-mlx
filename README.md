@@ -154,6 +154,30 @@ to zero error end-to-end. Requantizing those same weights to affine 4-bit costs
 `6bit`, `8bit` and `bf16` are not built: they would store upcast 4-bit values at
 2.26 / 2.95 / 5.56 TB, larger than the source, with zero quality gain.
 
+## Multimodal: verified end to end
+
+`scripts/vl_generate.py` runs the whole chain on a *published* artifact — PIL
+image → `KimiK3VisionProcessor` → MLX vision tower → `<|media_pad|>` expansion →
+quantized text tower → tokens:
+
+```
+image (448, 448) -> 1024 patches, grid (1, 32, 32), 256 image tokens
+prompt 14 tokens, 1 media_pad -> expands to 269
+prefill 269 merged positions in 9.8s (expected 269)
+--> The image shows two geometric shapes rendered as
+```
+
+The test image contains exactly two shapes (a red square, a blue circle) and the
+model reports "two geometric shapes" — correct count and category from an image
+it has never seen.
+
+The `269` is the load-bearing number. A same-length scatter — what mlx-vlm's
+Kimi-VL glue does, and the natural thing to copy — would have merged to 14
+positions, shown the model one token instead of 256, and still produced fluent
+text. `scripts/vision_test.py` covers the tower separately: weights bit-identical
+to source, token counts matching the processor, and cosine 0.21 between two
+different images (a tower ignoring its input would pass every shape check).
+
 ## Published
 
 | repo | size | experts | calibrated on | tok/s |
@@ -451,7 +475,7 @@ PY
 - [ ] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
       validated against the real processor end to end
-- [ ] publish to `pipenetwork/`
+- [x] publish to `pipenetwork/` (3 tiers)
 
 ## Provenance and licensing
 

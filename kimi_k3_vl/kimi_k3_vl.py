@@ -17,6 +17,7 @@ one image token and silently drop the rest, leaving a model that still generates
 fluent text while being effectively blind to most of the picture.
 """
 
+import os
 from typing import Any, List, Optional
 
 import mlx.core as mx
@@ -174,6 +175,49 @@ class Model(nn.Module):
         # text tower must be driven by the embeddings' own length.
         ids = mx.zeros(embeds.shape[:2], dtype=mx.int32)
         return self.language_model(ids, cache=cache, inputs_embeds=embeds)
+
+    @classmethod
+    def from_pretrained(cls, path):
+        """Build a multimodal model from a converted repo, quantization included.
+
+        mlx_lm.load_model handles quantization for the text tower, but it only
+        ever builds a text model. Doing it here keeps the VL wrapper able to load
+        the same artifacts: without this it constructs an unquantized 2.8T-shaped
+        model and the weights refuse to load.
+        """
+        import glob
+        import json as _json
+
+        import mlx.nn as _nn
+
+        cfg = _json.load(open(os.path.join(path, "config.json")))
+        model = cls(ModelConfig.from_dict(cfg))
+
+        weights = {}
+        for f in sorted(glob.glob(os.path.join(path, "*.safetensors"))):
+            weights.update(mx.load(f))
+        weights = model.sanitize(weights)
+
+        q = cfg.get("quantization")
+        if q:
+            # config keys are text-tower-relative ("model.layers.0...."); inside
+            # the wrapper the same module is "language_model.model.model.layers.0..."
+            prefix = "language_model.model."
+
+            def predicate(p, m):
+                key = p[len(prefix):] if p.startswith(prefix) else p
+                if key in q:
+                    return q[key]
+                if not hasattr(m, "to_quantized"):
+                    return False
+                return f"{p}.scales" in weights
+
+            _nn.quantize(model, group_size=q["group_size"], bits=q["bits"],
+                         mode=q.get("mode", "affine"), class_predicate=predicate)
+
+        model.load_weights(list(weights.items()))
+        mx.eval(model.parameters())
+        return model
 
     def sanitize(self, weights):
         """Route source keys to the two towers.
