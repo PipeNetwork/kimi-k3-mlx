@@ -891,11 +891,21 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         """
         self.pipeline_rank = group.rank()
         self.pipeline_size = group.size()
+        self.pipeline_group = group
         self.start_idx, self.end_idx = pipeline_bounds(
             len(self.layers), self.pipeline_size, self.pipeline_rank
         )
         self.layers = self.layers[: self.end_idx]
         self.layers[: self.start_idx] = [None] * self.start_idx
+
+    def _pipeline_barrier(self):
+        """Drain JACCL before changing operation type on its RDMA queue pair."""
+        marker = mx.distributed.all_sum(
+            mx.ones((10,), dtype=mx.float32),
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(marker)
 
     def _pipeline_masks(self, h, cache):
         ssm_cache = attn_cache = None
@@ -932,23 +942,30 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 f"Kimi-K3 UVMAX supports an unsharded model or exactly 2 ranks, got {size}"
             )
 
+        if rank < size - 1:
+            # JACCL point-to-point operations need an explicit matched
+            # collective before and after them.  The first barrier prevents a
+            # preceding operation from leaving queue-pair state behind; the
+            # second prevents rank 1 from entering the final all-gather before
+            # rank 0 has completed the receive.  Eager evaluation is
+            # intentional here: the pipeline boundary is inherently serial.
+            self._pipeline_barrier()
+
         if blocks is not None and self.start_idx:
             batch, length, hidden = h.shape
             previous = (
                 self.start_idx + self.args.attn_res_block_size - 1
             ) // self.args.attn_res_block_size
-            # Rank 0 enters this collective before its local layers while rank
-            # 1 enters it after producing the boundary packet below.  A matched
-            # JACCL all-gather gives the lazy scheduler an unambiguous global
-            # order and avoids point-to-point send/collective reordering at
-            # full Kimi-K3 graph scale.  For two ranks it is one bidirectional
-            # RDMA exchange, and the unused rank-0 half is tiny versus compute.
             packet_template = mx.zeros(
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
-            gathered = mx.distributed.all_gather(packet_template)
-            packet_count = packet_template.shape[0]
-            packet = gathered[packet_count : 2 * packet_count]
+            packet = mx.distributed.recv_like(
+                packet_template,
+                rank + 1,
+                group=self.pipeline_group,
+                stream=mx.cpu,
+            )
+            mx.eval(packet)
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -956,8 +973,16 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (rawf * rawf).mean(axis=-1) + self.args.rms_norm_eps
             )
         elif rank < size - 1:
-            batch = h.shape[0]
-            h = mx.distributed.all_gather(mx.zeros_like(h))[batch : 2 * batch]
+            h = mx.distributed.recv_like(
+                h,
+                rank + 1,
+                group=self.pipeline_group,
+                stream=mx.cpu,
+            )
+            mx.eval(h)
+
+        if rank < size - 1:
+            self._pipeline_barrier()
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -978,19 +1003,35 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             )
 
         if rank != 0:
+            self._pipeline_barrier()
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
-                boundary = mx.distributed.all_gather(packet)
+                sent = mx.distributed.send(
+                    packet,
+                    rank - 1,
+                    group=self.pipeline_group,
+                    stream=mx.cpu,
+                )
+                mx.eval(sent)
+                h = sent[0]
             else:
-                boundary = mx.distributed.all_gather(h)
-            # Keep the boundary collective in rank 1's graph even though only
-            # rank 0 consumes its payload.
-            h = mx.depends(h, boundary)
+                h = mx.distributed.send(
+                    h,
+                    rank - 1,
+                    group=self.pipeline_group,
+                    stream=mx.cpu,
+                )
+                mx.eval(h)
+            self._pipeline_barrier()
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.
         if size > 1:
-            h = mx.distributed.all_gather(h)[: h.shape[0]]
+            h = mx.distributed.all_gather(
+                h,
+                group=self.pipeline_group,
+                stream=mx.cpu,
+            )[: h.shape[0]]
         return self.norm(h)
 
 

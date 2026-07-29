@@ -15,13 +15,18 @@ def load_distributed(stage: Path, group):
     return model
 
 
-def run_two_steps(model):
+def run_steps(model, prefill_length: int, decode_steps: int):
     cache = model.make_cache()
-    prefill = model(mx.array([[1, 2, 3]], dtype=mx.int32), cache=cache)
+    prefill_tokens = (mx.arange(prefill_length, dtype=mx.int32) % 127 + 1)[None]
+    prefill = model(prefill_tokens, cache=cache)
     mx.eval(prefill)
-    decode = model(mx.array([[4]], dtype=mx.int32), cache=cache)
-    mx.eval(decode)
-    return prefill, decode
+    outputs = [prefill]
+    for step in range(decode_steps):
+        token = mx.array([[(prefill_length + step) % 127 + 1]], dtype=mx.int32)
+        output = model(token, cache=cache)
+        mx.eval(output)
+        outputs.append(output)
+    return outputs
 
 
 def main() -> int:
@@ -33,7 +38,11 @@ def main() -> int:
         default="ring",
         help="Distributed backend to initialize (default: ring for local CI).",
     )
+    parser.add_argument("--prefill-length", type=int, default=3)
+    parser.add_argument("--decode-steps", type=int, default=1)
     args = parser.parse_args()
+    if args.prefill_length < 1 or args.decode_steps < 1:
+        raise ValueError("prefill length and decode steps must be positive")
     group = mx.distributed.init(strict=True, backend=args.backend)
     if group.size() != 2:
         raise RuntimeError(f"expected two ranks, got {group.size()}")
@@ -41,19 +50,23 @@ def main() -> int:
     stage = args.root.resolve() / f"rank{rank}"
 
     distributed = load_distributed(stage, group)
-    actual_prefill, actual_decode = run_two_steps(distributed)
+    actual = run_steps(distributed, args.prefill_length, args.decode_steps)
 
     reference, _ = load_model(stage, lazy=False, strict=True)
-    expected_prefill, expected_decode = run_two_steps(reference)
-    prefill_error = mx.max(mx.abs(actual_prefill - expected_prefill)).item()
-    decode_error = mx.max(mx.abs(actual_decode - expected_decode)).item()
+    expected = run_steps(reference, args.prefill_length, args.decode_steps)
+    errors = [
+        mx.max(mx.abs(actual_output - expected_output)).item()
+        for actual_output, expected_output in zip(actual, expected)
+    ]
+    prefill_error = errors[0]
+    decode_error = max(errors[1:])
     if prefill_error > 2e-4 or decode_error > 2e-4:
         raise AssertionError(
             f"pipeline mismatch: prefill={prefill_error}, decode={decode_error}"
         )
     print(
         f"[rank {rank}] pipeline parity: prefill={prefill_error:.3g}, "
-        f"decode={decode_error:.3g}",
+        f"decode={decode_error:.3g} ({args.decode_steps} steps)",
         flush=True,
     )
     return 0
