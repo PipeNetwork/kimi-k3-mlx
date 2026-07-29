@@ -139,11 +139,10 @@ def screen_bootstrap(script: str, log: Path) -> str:
 
 
 def remote_screen_command(name: str, bootstrap: str) -> str:
-    """Keep screen's proven foreground mode but orphan it safely from SSH."""
+    """Keep screen in foreground so a backgrounded SSH session stays alive."""
     return (
-        f"nohup /usr/bin/screen -DmS {shlex.quote(name)} "
-        f"/bin/bash -lc {shlex.quote(bootstrap)} "
-        "</dev/null >/dev/null 2>&1 &"
+        f"/usr/bin/screen -DmS {shlex.quote(name)} "
+        f"/bin/bash -lc {shlex.quote(bootstrap)}"
     )
 
 
@@ -164,7 +163,22 @@ def launch_screen(
             start_new_session=True,
         )
     else:
-        ssh(remote, remote_screen_command(name, bootstrap))
+        subprocess.run(
+            [
+                "ssh",
+                "-f",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                remote,
+                remote_screen_command(name, bootstrap),
+            ],
+            check=True,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
 
 
 def stop_screen(name: str, *, remote: str | None = None) -> None:
