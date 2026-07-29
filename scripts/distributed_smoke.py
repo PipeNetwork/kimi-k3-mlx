@@ -29,6 +29,25 @@ def run_steps(model, prefill_length: int, decode_steps: int):
     return outputs
 
 
+def run_boundary_probe(model, group, length: int, hidden_size: int) -> float:
+    """Exercise the production-size acknowledged point-to-point boundary."""
+    rank = group.rank()
+    # Kimi-K3 rank 1 sends h plus four AttnRes blocks at the 47-layer split.
+    shape = (5, 1, length, hidden_size)
+    if rank == 1:
+        packet = mx.full(shape, 1.25, dtype=mx.bfloat16)
+        transferred = model.model._pipeline_send(packet, 0)
+    else:
+        template = mx.zeros(shape, dtype=mx.bfloat16)
+        transferred = model.model._pipeline_recv(template, 1)
+    error = mx.max(mx.abs(transferred.astype(mx.float32) - 1.25)).item()
+    print(
+        f"[rank {rank}] boundary probe: shape={shape}, error={error:.3g}",
+        flush=True,
+    )
+    return error
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("work/tiny-uvmax-pipeline-2"))
@@ -40,6 +59,11 @@ def main() -> int:
     )
     parser.add_argument("--prefill-length", type=int, default=3)
     parser.add_argument("--decode-steps", type=int, default=1)
+    parser.add_argument(
+        "--production-boundary-probe",
+        action="store_true",
+        help="Transfer a 5x1xLx7168 BF16 packet before model parity.",
+    )
     args = parser.parse_args()
     if args.prefill_length < 1 or args.decode_steps < 1:
         raise ValueError("prefill length and decode steps must be positive")
@@ -50,6 +74,10 @@ def main() -> int:
     stage = args.root.resolve() / f"rank{rank}"
 
     distributed = load_distributed(stage, group)
+    if args.production_boundary_probe:
+        boundary_error = run_boundary_probe(distributed, group, args.prefill_length, 7168)
+        if boundary_error != 0:
+            raise AssertionError(f"production boundary mismatch: {boundary_error}")
     actual = run_steps(distributed, args.prefill_length, args.decode_steps)
 
     reference, _ = load_model(stage, lazy=False, strict=True)

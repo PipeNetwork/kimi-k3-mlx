@@ -907,6 +907,54 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         )
         mx.eval(marker)
 
+    def _pipeline_recv(self, template, source):
+        """Receive a pipeline packet and acknowledge its remote completion.
+
+        A receive can become locally visible before the sender has retired the
+        corresponding RDMA work request.  Entering a collective in that window
+        deadlocks JACCL for packets larger than its eager path: the receiver is
+        already polling all-reduce while the sender is still polling send.  A
+        small reverse-direction acknowledgement keeps both peers in point-to-
+        point mode until the payload sender has completed.
+        """
+        self._pipeline_barrier()
+        value = mx.distributed.recv_like(
+            template,
+            source,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(value)
+        acknowledged = mx.distributed.send(
+            mx.ones((10,), dtype=mx.float32),
+            source,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(acknowledged)
+        self._pipeline_barrier()
+        return value
+
+    def _pipeline_send(self, value, destination):
+        """Send a pipeline packet and wait for the receiver's acknowledgement."""
+        self._pipeline_barrier()
+        sent = mx.distributed.send(
+            value,
+            destination,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(sent)
+        acknowledged = mx.distributed.recv_like(
+            mx.zeros((10,), dtype=mx.float32),
+            destination,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(acknowledged)
+        self._pipeline_barrier()
+        return sent
+
     def _pipeline_masks(self, h, cache):
         ssm_cache = attn_cache = None
         for layer, layer_cache in zip(self.pipeline_layers, cache):
@@ -942,15 +990,6 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 f"Kimi-K3 UVMAX supports an unsharded model or exactly 2 ranks, got {size}"
             )
 
-        if rank < size - 1:
-            # JACCL point-to-point operations need an explicit matched
-            # collective before and after them.  The first barrier prevents a
-            # preceding operation from leaving queue-pair state behind; the
-            # second prevents rank 1 from entering the final all-gather before
-            # rank 0 has completed the receive.  Eager evaluation is
-            # intentional here: the pipeline boundary is inherently serial.
-            self._pipeline_barrier()
-
         if blocks is not None and self.start_idx:
             batch, length, hidden = h.shape
             previous = (
@@ -959,13 +998,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             packet_template = mx.zeros(
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
-            packet = mx.distributed.recv_like(
-                packet_template,
-                rank + 1,
-                group=self.pipeline_group,
-                stream=mx.cpu,
-            )
-            mx.eval(packet)
+            packet = self._pipeline_recv(packet_template, rank + 1)
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -973,16 +1006,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (rawf * rawf).mean(axis=-1) + self.args.rms_norm_eps
             )
         elif rank < size - 1:
-            h = mx.distributed.recv_like(
-                h,
-                rank + 1,
-                group=self.pipeline_group,
-                stream=mx.cpu,
-            )
-            mx.eval(h)
-
-        if rank < size - 1:
-            self._pipeline_barrier()
+            h = self._pipeline_recv(h, rank + 1)
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -1003,26 +1027,12 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             )
 
         if rank != 0:
-            self._pipeline_barrier()
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
-                sent = mx.distributed.send(
-                    packet,
-                    rank - 1,
-                    group=self.pipeline_group,
-                    stream=mx.cpu,
-                )
-                mx.eval(sent)
+                sent = self._pipeline_send(packet, rank - 1)
                 h = sent[0]
             else:
-                h = mx.distributed.send(
-                    h,
-                    rank - 1,
-                    group=self.pipeline_group,
-                    stream=mx.cpu,
-                )
-                mx.eval(h)
-            self._pipeline_barrier()
+                h = self._pipeline_send(h, rank - 1)
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.

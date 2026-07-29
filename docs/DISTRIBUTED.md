@@ -37,8 +37,13 @@ The embedding, final norm/AttnRes, and LM head endpoint shards are duplicated
 because released mlx-lm generation samples on every rank. Vision weights are
 not downloaded for the text benchmark. The boundary sends one packed BF16
 message containing the current hidden state and accumulated AttnRes blocks;
-the receiver reconstructs inverse-RMS state locally. Miniature-model tests show
-bit-exact equality with the unsharded prefill and cached decode paths.
+the receiver reconstructs inverse-RMS state locally. The transfer is fenced by
+CPU collectives and a reverse-direction point-to-point acknowledgement. The
+acknowledgement is required because a large receive can become locally visible
+before the remote send retires; changing that RDMA queue to a collective in
+that window deadlocks JACCL. The stress test transfers the production-shaped
+5 x 1 x 64 x 7168 BF16 packet before checking bit-exact miniature-model prefill
+and cached decode parity.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source
@@ -114,7 +119,9 @@ No code path silently selects ring, MPI, Ethernet, or a single process.
 Before reporting a result:
 
 1. `scripts/test_all.sh` passes in the frozen environment.
-2. The tiny two-rank parity worker passes for prefill and decode.
+2. The two-rank worker passes the production-sized boundary transfer plus
+   64-token prefill and 32 cached decode steps, first locally and then on real
+   JACCL/RDMA.
 3. Both stage manifests are complete and all byte sizes validate.
 4. RDMA reports active on both machines and JACCL initialization succeeds.
 5. A deterministic 32-token smoke prompt produces coherent output.
