@@ -306,6 +306,11 @@ def launch(args: argparse.Namespace) -> int:
         "MLX_JACCL_COORDINATOR": coordinator,
         "MLX_METAL_FAST_SYNCH": "1",
     }
+    jaccl_ring = os.environ.get("MLX_JACCL_RING")
+    if jaccl_ring is not None:
+        if jaccl_ring not in ("0", "1"):
+            raise ValueError("MLX_JACCL_RING must be 0 or 1")
+        common["MLX_JACCL_RING"] = jaccl_ring
     local_log = run_dir / "rank0.log"
     local_exit = run_dir / "rank0.exit"
     local_pid_path = run_dir / "rank0.pid"
@@ -372,6 +377,7 @@ def launch(args: argparse.Namespace) -> int:
         "transport": "thunderbolt-rdma",
         "coordinator": coordinator,
         "control_coordinator": control_coordinator,
+        "jaccl_ring": jaccl_ring == "1",
         "hostfile": str(args.hostfile.resolve()),
         "hostfile_sha256": hostfile_sha256,
         "devices": devices,

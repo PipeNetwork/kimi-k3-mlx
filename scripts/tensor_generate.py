@@ -163,6 +163,7 @@ def main() -> int:
                 },
                 "rdma": rdma,
                 "jaccl_hostfile_sha256": os.environ.get("KIMI_HOSTFILE_SHA256"),
+                "jaccl_ring": os.environ.get("MLX_JACCL_RING") == "1",
                 "mlx_metal_fast_synch": os.environ.get("MLX_METAL_FAST_SYNCH"),
                 "host": host,
                 "platform": platform.platform(),

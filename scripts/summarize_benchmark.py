@@ -55,6 +55,7 @@ def validate_pair(rank0: dict, rank1: dict) -> dict:
         "versions",
         "checkpoint",
         "jaccl_hostfile_sha256",
+        "jaccl_ring",
         "prompt",
         "seed",
         "sampling",

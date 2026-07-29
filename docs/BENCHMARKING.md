@@ -16,6 +16,8 @@ checkpoint revision, host topology, command, and machine-readable record.
 - `MLX_METAL_FAST_SYNCH=1` (set by `scripts/run_tensor.sh` through the shared launcher).
 - Deterministic sampling (`temperature=0`, seed 0) unless the result explicitly
   studies another sampler.
+- Default JACCL mesh collectives. Set `MLX_JACCL_RING=1` only for an explicitly
+  labeled comparison; the runner records and validates the selected mode.
 
 ## Required procedure
 
