@@ -30,7 +30,7 @@ checkpoint revision, host topology, command, and machine-readable record.
 6. Record prompt tok/s, decode tok/s, prompt/generated token counts, peak memory,
    load time, checkpoint revision, code commit, OS build, and exact MLX versions.
 
-Example:
+One-off example:
 
 ```bash
 scripts/run_distributed.sh \
@@ -39,9 +39,20 @@ scripts/run_distributed.sh \
   --max-tokens 256
 ```
 
+Canonical suite (one model load, warm-up, three prompts, three repetitions):
+
+```bash
+scripts/run_distributed.sh \
+  --run-id "$(git rev-parse --short HEAD)-canonical" \
+  --suite benchmarks/prompts.json \
+  --warmup-tokens 32 \
+  --repetitions 3 \
+  --max-tokens 256
+```
+
 The runner writes `work/benchmarks/<run-id>-rank<rank>.json` locally on each
-host. Copy rank 1's record back before summarizing a run. Never hand-copy just a
-tok/s number into a pull request.
+host, plus a summary containing median/range. Copy rank 1's records back before
+summarizing a run. Never hand-copy just a tok/s number into a pull request.
 
 ## Correctness gates
 

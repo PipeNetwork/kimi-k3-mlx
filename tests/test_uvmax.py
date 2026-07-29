@@ -1,6 +1,9 @@
 import unittest
 import sys
+import json
+import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import mlx.core as mx
 
@@ -8,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mlx_lm.models import kimi_k3_uvmax
+from scripts.distributed_generate import benchmark_cases
 from scripts.prepare_uvmax_stage import pipeline_bounds, select_stage_files
 
 
@@ -68,6 +72,34 @@ class FakeGroup:
 
 
 class TestUvmaxStage(unittest.TestCase):
+    def test_benchmark_suite_validation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "suite.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "prompts": [
+                            {"id": "factual", "prompt": "Hello"},
+                            {"id": "code-1", "prompt": "Write code", "max_tokens": 64},
+                        ]
+                    }
+                )
+            )
+            cases = benchmark_cases(
+                SimpleNamespace(
+                    suite=path,
+                    prompt="unused",
+                    max_tokens=256,
+                )
+            )
+            self.assertEqual(
+                cases,
+                [
+                    {"id": "factual", "prompt": "Hello", "max_tokens": 256},
+                    {"id": "code-1", "prompt": "Write code", "max_tokens": 64},
+                ],
+            )
+
     def test_file_selection_keeps_text_common_and_local_layers(self):
         weight_map = {
             "language_model.model.embed_tokens.weight": "begin.safetensors",

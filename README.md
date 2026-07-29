@@ -292,7 +292,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers both loaders, runs all 82 tests
+scripts/test_all.sh                     # registers both loaders, runs all 83 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -307,7 +307,7 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | `test_vision_parity.py` | vision tower vs torch reference | 9 |
 | `test_processor_integration.py` | real processor -> MLX tower | 7 |
 | `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
-| `test_uvmax.py` | stable loader + rank-local selection + odd pipeline split | 3 |
+| `test_uvmax.py` | loader, stage selection, benchmark suite, pipeline split | 4 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -656,7 +656,7 @@ not a performance-degrading fallback.
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 82 tests discovered: 75 passing, 7 hardware/reference-data skips
+- [x] 83 tests discovered: 76 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,

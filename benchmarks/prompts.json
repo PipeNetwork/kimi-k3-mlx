@@ -1,0 +1,16 @@
+{
+  "prompts": [
+    {
+      "id": "factual",
+      "prompt": "Who is Albert Einstein? Give a concise but complete answer."
+    },
+    {
+      "id": "code",
+      "prompt": "Implement a stable merge sort for a generic mutable slice in Rust. Explain the complexity and include tests."
+    },
+    {
+      "id": "reasoning",
+      "prompt": "A farmer has chickens and rabbits. There are 35 heads and 94 legs. Determine how many of each animal there are, and verify the result step by step."
+    }
+  ]
+}
