@@ -914,6 +914,11 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         essential; leaving rank 1's boundary lazy lets the following
         all-gather overtake it at full-model graph scale.
         """
+        # JACCL's CPU all-gather copies directly from the input buffer.  A
+        # lazy/non-contiguous packet can otherwise overlap its producing Metal
+        # kernels and crash in JACCL's memmove at full-model scale.
+        value = mx.contiguous(value)
+        mx.eval(value)
         gathered = mx.distributed.all_gather(
             value,
             group=self.pipeline_group,
@@ -1006,6 +1011,8 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.
         if size > 1:
+            h = mx.contiguous(h)
+            mx.eval(h)
             gathered = mx.distributed.all_gather(
                 h,
                 group=self.pipeline_control_group,

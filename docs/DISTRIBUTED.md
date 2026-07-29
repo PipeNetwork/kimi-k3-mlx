@@ -42,9 +42,10 @@ final hidden-state synchronization use two independent JACCL backend instances,
 both on the same mandatory RDMA fabric. Each operation is a matched all-gather:
 rank 1 contributes the boundary packet while rank 0 contributes zeros, and the
 second mesh distributes rank 0's completed hidden state. Both collectives are
-evaluated eagerly before either rank can enqueue the next one. This avoids the
-point-to-point remote-retirement ambiguity and the lazy collective reordering
-seen at full-model graph scale. The stress test transfers the
+fed row-contiguous tensors that are fully materialized before JACCL starts, and
+are evaluated eagerly before either rank can enqueue the next operation. This
+avoids both cross-stream `memmove` races and the lazy collective reordering seen
+at full-model graph scale. The stress test transfers the
 production-shaped 5 x 1 x 64 x 7168 BF16 packet before checking bit-exact
 miniature-model prefill and cached decode parity.
 

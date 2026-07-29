@@ -649,8 +649,9 @@ scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 `scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
 mode and requires exactly two ranks. Boundary and final-state transfers use
 eager, matched all-gathers on two independent JACCL backend instances over the
-same RDMA fabric. Eager evaluation prevents full-model lazy graphs from
-reordering different collective shapes. A missing RDMA/JACCL fabric is an
+same RDMA fabric. Inputs are made row-contiguous and fully materialized before
+JACCL's CPU copy begins; eager evaluation then prevents full-model lazy graphs
+from reordering different collective shapes. A missing RDMA/JACCL fabric is an
 error, not a performance-degrading fallback.
 
 ## Status
