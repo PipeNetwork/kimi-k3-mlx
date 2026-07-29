@@ -30,6 +30,46 @@ done
     exit 2
 }
 
+LOCK_DIR="work/.distributed-run.lock"
+LOCK_OWNER="$LOCK_DIR/owner"
+
+release_lock() {
+    if [[ -f "$LOCK_OWNER" ]] && [[ "$(awk '{print $1}' "$LOCK_OWNER")" == "$$" ]]; then
+        rm -f -- "$LOCK_OWNER"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    fi
+}
+
+acquire_lock() {
+    mkdir -p work
+    for ((attempt = 0; attempt < 3; attempt++)); do
+        if mkdir "$LOCK_DIR" 2>/dev/null; then
+            printf '%s %s\n' "$$" "$RUN_ID" >"$LOCK_OWNER"
+            trap release_lock EXIT HUP INT TERM
+            return 0
+        fi
+
+        # Allow the process that created the directory a moment to publish
+        # its owner before deciding whether this is a stale crash/reboot lock.
+        if [[ ! -f "$LOCK_OWNER" ]]; then
+            sleep 1
+            [[ -f "$LOCK_OWNER" ]] || rmdir "$LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        read -r owner_pid owner_run <"$LOCK_OWNER"
+        if [[ "$owner_pid" =~ ^[0-9]+$ ]] && kill -0 "$owner_pid" 2>/dev/null; then
+            echo "Distributed run $owner_run is already active as PID $owner_pid" >&2
+            return 1
+        fi
+        rm -f -- "$LOCK_OWNER"
+        rmdir "$LOCK_DIR" 2>/dev/null || true
+    done
+    echo "Could not acquire $LOCK_DIR" >&2
+    return 1
+}
+
+acquire_lock
+
 test -f "$HOSTFILE" || {
     echo "Missing $HOSTFILE; run scripts/configure_jaccl.sh after connecting Thunderbolt 5." >&2
     exit 1
