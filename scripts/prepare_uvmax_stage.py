@@ -239,7 +239,14 @@ def main() -> int:
 
     manifest = {
         "format": 1,
-        "source": {"repo": args.repo, "revision": args.revision},
+        "source": {
+            "repo": args.repo,
+            "revision": args.revision,
+            "weight_bytes": int(index.get("metadata", {}).get("total_size", 0)),
+            "total_parameters": int(
+                index.get("metadata", {}).get("total_parameters", 0)
+            ),
+        },
         "pipeline": {
             "rank": args.rank,
             "world_size": args.world_size,
