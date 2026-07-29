@@ -27,8 +27,14 @@ def run_two_steps(model):
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--root", type=Path, default=Path("work/tiny-uvmax-pipeline-2"))
+    parser.add_argument(
+        "--backend",
+        choices=("ring", "jaccl"),
+        default="ring",
+        help="Distributed backend to initialize (default: ring for local CI).",
+    )
     args = parser.parse_args()
-    group = mx.distributed.init(strict=True, backend="ring")
+    group = mx.distributed.init(strict=True, backend=args.backend)
     if group.size() != 2:
         raise RuntimeError(f"expected two ranks, got {group.size()}")
     rank = group.rank()
