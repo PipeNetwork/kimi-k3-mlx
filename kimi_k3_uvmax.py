@@ -900,57 +900,27 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             raise ValueError("pipeline payload and control groups do not match")
         self.pipeline_payload_stream = mx.new_stream(mx.cpu)
         self.pipeline_control_stream = mx.new_stream(mx.cpu)
-        self._pipeline_pending_sends = []
         self.start_idx, self.end_idx = pipeline_bounds(
             len(self.layers), self.pipeline_size, self.pipeline_rank
         )
         self.layers = self.layers[: self.end_idx]
         self.layers[: self.start_idx] = [None] * self.start_idx
 
-    def _pipeline_barrier(self):
-        """Synchronize on the independent JACCL control queue pair."""
-        marker = mx.distributed.all_sum(
-            mx.ones((10,), dtype=mx.float32),
-            group=self.pipeline_control_group,
-            stream=self.pipeline_control_stream,
-        )
-        mx.eval(marker)
+    def _pipeline_exchange(self, value):
+        """Run and fully evaluate the matched boundary all-gather.
 
-    def _pipeline_recv(self, template, source):
-        """Evaluate the payload receive, then synchronize the control mesh.
-
-        A receive can become locally visible before the sender has retired the
-        corresponding RDMA work request.  The sender therefore remains lazy on
-        a dedicated payload CPU stream while this evaluated receive proves the
-        bytes arrived.  Control synchronization runs concurrently on a second
-        CPU stream and independent JACCL queue pair.
+        Both ranks enter with the same shape: rank 1 contributes the computed
+        boundary packet and rank 0 contributes zeros.  Eager evaluation is
+        essential; leaving rank 1's boundary lazy lets the following
+        all-gather overtake it at full-model graph scale.
         """
-        self._pipeline_barrier()
-        value = mx.distributed.recv_like(
-            template,
-            source,
-            group=self.pipeline_group,
-            stream=self.pipeline_payload_stream,
-        )
-        mx.eval(value)
-        self._pipeline_barrier()
-        return value
-
-    def _pipeline_send(self, value, destination):
-        """Enqueue a lazy payload send while synchronizing the control mesh."""
-        self._pipeline_barrier()
-        sent = mx.distributed.send(
+        gathered = mx.distributed.all_gather(
             value,
-            destination,
             group=self.pipeline_group,
             stream=self.pipeline_payload_stream,
         )
-        mx.async_eval(sent)
-        # Retain the lazy graph for the life of the model; evaluating or
-        # releasing each send eagerly recreates the JACCL retirement deadlock.
-        self._pipeline_pending_sends.append(sent)
-        self._pipeline_barrier()
-        return value
+        mx.eval(gathered)
+        return gathered
 
     def _pipeline_masks(self, h, cache):
         ssm_cache = attn_cache = None
@@ -995,7 +965,9 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             packet_template = mx.zeros(
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
-            packet = self._pipeline_recv(packet_template, rank + 1)
+            gathered = self._pipeline_exchange(packet_template)
+            packet_count = packet_template.shape[0]
+            packet = gathered[packet_count : 2 * packet_count]
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -1003,7 +975,8 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (rawf * rawf).mean(axis=-1) + self.args.rms_norm_eps
             )
         elif rank < size - 1:
-            h = self._pipeline_recv(h, rank + 1)
+            batch = h.shape[0]
+            h = self._pipeline_exchange(mx.zeros_like(h))[batch : 2 * batch]
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -1026,19 +999,20 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         if rank != 0:
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
-                sent = self._pipeline_send(packet, rank - 1)
-                h = sent[0]
+                self._pipeline_exchange(packet)
             else:
-                h = self._pipeline_send(h, rank - 1)
+                self._pipeline_exchange(h)
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.
         if size > 1:
-            h = mx.distributed.all_gather(
+            gathered = mx.distributed.all_gather(
                 h,
                 group=self.pipeline_control_group,
                 stream=self.pipeline_control_stream,
-            )[: h.shape[0]]
+            )
+            mx.eval(gathered)
+            h = gathered[: h.shape[0]]
         return self.norm(h)
 
 

@@ -39,12 +39,13 @@ def run_boundary_probe(model, group, length: int, hidden_size: int) -> float:
     rank = group.rank()
     # Kimi-K3 rank 1 sends h plus four AttnRes blocks at the 47-layer split.
     shape = (5, 1, length, hidden_size)
-    if rank == 1:
-        packet = mx.full(shape, 1.25, dtype=mx.bfloat16)
-        transferred = model.model._pipeline_send(packet, 0)
-    else:
-        template = mx.zeros(shape, dtype=mx.bfloat16)
-        transferred = model.model._pipeline_recv(template, 1)
+    packet = (
+        mx.full(shape, 1.25, dtype=mx.bfloat16)
+        if rank == 1
+        else mx.zeros(shape, dtype=mx.bfloat16)
+    )
+    gathered = model.model._pipeline_exchange(packet)
+    transferred = gathered[shape[0] :]
     error = mx.max(mx.abs(transferred.astype(mx.float32) - 1.25)).item()
     print(
         f"[rank {rank}] boundary probe: shape={shape}, error={error:.3g}",

@@ -37,16 +37,16 @@ The embedding, final norm/AttnRes, and LM head endpoint shards are duplicated
 because released mlx-lm generation samples on every rank. Vision weights are
 not downloaded for the text benchmark. The boundary sends one packed BF16
 message containing the current hidden state and accumulated AttnRes blocks;
-the receiver reconstructs inverse-RMS state locally. Payload transfer and
-control synchronization use two independent JACCL backend instances, both on
-the same mandatory RDMA fabric. This is required because a large receive can
-become locally visible before the remote send retires. Rank 1 therefore keeps
-the send lazy on a dedicated CPU stream; rank 0 evaluates the receive to prove
-data arrival. Barriers and final all-gather run concurrently on a second CPU
-stream and second RDMA queue pair, so the payload queue never changes operation
-type while its send retires. The stress test transfers the production-shaped
-5 x 1 x 64 x 7168 BF16 packet while synchronizing on the independent control
-mesh, then checks bit-exact miniature-model prefill and cached decode parity.
+the receiver reconstructs inverse-RMS state locally. Boundary transfer and
+final hidden-state synchronization use two independent JACCL backend instances,
+both on the same mandatory RDMA fabric. Each operation is a matched all-gather:
+rank 1 contributes the boundary packet while rank 0 contributes zeros, and the
+second mesh distributes rank 0's completed hidden state. Both collectives are
+evaluated eagerly before either rank can enqueue the next one. This avoids the
+point-to-point remote-retirement ambiguity and the lazy collective reordering
+seen at full-model graph scale. The stress test transfers the
+production-shaped 5 x 1 x 64 x 7168 BF16 packet before checking bit-exact
+miniature-model prefill and cached decode parity.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source
