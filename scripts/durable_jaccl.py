@@ -139,11 +139,11 @@ def screen_bootstrap(script: str, log: Path) -> str:
 
 
 def remote_screen_command(name: str, bootstrap: str) -> str:
-    """Detach screen itself from SSH, not only the worker it launches."""
+    """Keep screen's proven foreground mode but orphan it safely from SSH."""
     return (
-        f"/usr/bin/screen -dmS {shlex.quote(name)} "
+        f"nohup /usr/bin/screen -DmS {shlex.quote(name)} "
         f"/bin/bash -lc {shlex.quote(bootstrap)} "
-        "</dev/null >/dev/null 2>&1"
+        "</dev/null >/dev/null 2>&1 &"
     )
 
 
@@ -157,7 +157,7 @@ def launch_screen(
     bootstrap = screen_bootstrap(script, log)
     if remote is None:
         subprocess.Popen(
-            ["/usr/bin/screen", "-dmS", name, "/bin/bash", "-lc", bootstrap],
+            ["/usr/bin/screen", "-DmS", name, "/bin/bash", "-lc", bootstrap],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,

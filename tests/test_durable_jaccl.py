@@ -115,8 +115,8 @@ class TestDurableJaccl(unittest.TestCase):
         command = remote_screen_command("rank one", "echo worker")
         self.assertEqual(
             command,
-            "/usr/bin/screen -dmS 'rank one' /bin/bash -lc 'echo worker' "
-            "</dev/null >/dev/null 2>&1",
+            "nohup /usr/bin/screen -DmS 'rank one' /bin/bash -lc 'echo worker' "
+            "</dev/null >/dev/null 2>&1 &",
         )
 
 
