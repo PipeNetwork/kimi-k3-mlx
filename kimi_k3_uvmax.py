@@ -939,7 +939,6 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
             packet = mx.distributed.recv_like(packet_template, rank + 1)
-            mx.eval(packet)
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -948,7 +947,6 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             )
         elif rank < size - 1:
             h = mx.distributed.recv_like(h, rank + 1)
-            mx.eval(h)
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -972,11 +970,9 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
                 sent = mx.distributed.send(packet, rank - 1)
-                mx.eval(sent)
                 h = sent[0]
             else:
                 h = mx.distributed.send(h, rank - 1)
-                mx.eval(h)
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.
