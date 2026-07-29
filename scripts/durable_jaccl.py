@@ -44,14 +44,23 @@ def shell_worker(
     command: list[str],
     environment: dict[str, str],
     exit_path: Path,
+    pid_path: Path | None = None,
 ) -> str:
     exports = " ".join(
         f"export {name}={shlex.quote(value)};"
         for name, value in sorted(environment.items())
     )
     argv = shlex.join(command)
+    publish_pid = ""
+    if pid_path is not None:
+        publish_pid = (
+            f"printf '%s\\n' \"$$\" > {shlex.quote(str(pid_path))}.tmp; "
+            f"mv {shlex.quote(str(pid_path))}.tmp {shlex.quote(str(pid_path))}; "
+        )
     return (
         f"cd {shlex.quote(str(repo))}; "
+        "trap '' HUP; "
+        f"{publish_pid}"
         f"{exports} "
         "set +e; "
         f"{argv}; "
@@ -60,6 +69,30 @@ def shell_worker(
         f"mv {shlex.quote(str(exit_path))}.tmp {shlex.quote(str(exit_path))}; "
         "exit \"$rank_exit\""
     )
+
+
+def launch_ssh_worker(remote: str, script: str, log: Path) -> subprocess.Popen:
+    """Run a rank under the forced-PTY SSH context proven by mlx.launch."""
+    handle = log.open("ab", buffering=0)
+    try:
+        return subprocess.Popen(
+            [
+                "ssh",
+                "-tt",
+                "-o",
+                "BatchMode=yes",
+                "-o",
+                "ConnectTimeout=5",
+                remote,
+                f"stty -echo; {script}",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=handle,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    finally:
+        handle.close()
 
 
 def ssh(remote: str, script: str, *, capture: bool = False) -> subprocess.CompletedProcess:
@@ -88,6 +121,27 @@ def remote_text(remote: str, path: Path) -> str | None:
     return result.stdout.strip() if result.returncode == 0 else None
 
 
+def wait_for_remote_pid(
+    remote: str,
+    path: Path,
+    *,
+    timeout: float = 10,
+) -> int:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        value = remote_text(remote, path)
+        if value is not None:
+            try:
+                pid = int(value)
+            except ValueError as error:
+                raise RuntimeError(f"invalid remote rank PID in {path}: {value!r}") from error
+            if pid > 0:
+                return pid
+            raise RuntimeError(f"invalid remote rank PID in {path}: {pid}")
+        time.sleep(0.1)
+    raise TimeoutError(f"remote rank did not publish {path} within {timeout:g} seconds")
+
+
 def rank_alive(remote: str | None, pid: int) -> bool:
     if remote is None:
         try:
@@ -110,6 +164,35 @@ def rank_alive(remote: str | None, pid: int) -> bool:
     )
     # A transient SSH failure is not evidence that a durable rank died.
     return result.returncode in (0, 255)
+
+
+def wait_for_local_coordinator(
+    host: str,
+    port: int,
+    process: subprocess.Popen,
+    *,
+    timeout: float = 60,
+) -> None:
+    """Wait for rank 0 to listen without consuming JACCL's one peer socket."""
+    deadline = time.monotonic() + timeout
+    endpoint = f"TCP@{host}:{port}"
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            raise RuntimeError(
+                f"rank 0 exited with status {process.returncode} before "
+                "opening the JACCL coordinator"
+            )
+        listener = subprocess.run(
+            ["lsof", "-nP", f"-i{endpoint}", "-sTCP:LISTEN"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if listener.returncode == 0:
+            return
+        time.sleep(0.1)
+    raise TimeoutError(
+        f"rank 0 did not listen on {host}:{port} within {timeout:g} seconds"
+    )
 
 
 def launch(args: argparse.Namespace) -> int:
@@ -152,21 +235,18 @@ def launch(args: argparse.Namespace) -> int:
     }
     local_log = run_dir / "rank0.log"
     local_exit = run_dir / "rank0.exit"
+    local_pid_path = run_dir / "rank0.pid"
     local_env = {
         **common,
         "MLX_IBV_DEVICES": str(device_path),
         "MLX_RANK": "0",
     }
-    local_script = shell_worker(repo, command, local_env, local_exit)
-    local_handle = local_log.open("ab", buffering=0)
-    local_process = subprocess.Popen(
-        ["/bin/bash", "-lc", local_script],
-        stdin=subprocess.DEVNULL,
-        stdout=local_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    local_script = shell_worker(
+        repo, command, local_env, local_exit, local_pid_path
     )
-    local_handle.close()
+    local_process = launch_ssh_worker(
+        hostfile["hosts"][0]["ssh"], local_script, local_log
+    )
 
     remote_log = remote_run_dir / "rank1.log"
     remote_exit = remote_run_dir / "rank1.exit"
@@ -178,12 +258,22 @@ def launch(args: argparse.Namespace) -> int:
     remote_script = shell_worker(
         Path(args.remote_repo), command, remote_env, remote_exit
     )
-    detached = (
-        f"nohup /bin/bash -lc {shlex.quote(remote_script)} "
-        f"</dev/null >{shlex.quote(str(remote_log))} 2>&1 & printf '%s\\n' $!"
+    remote_pid_path = remote_run_dir / "rank1.pid"
+    screen_name = f"kimi-{hashlib.sha256(args.run_id.encode()).hexdigest()[:16]}"
+    remote_bootstrap = (
+        f"exec </dev/null >>{shlex.quote(str(remote_log))} 2>&1; "
+        f"printf '%s\\n' \"$$\" > {shlex.quote(str(remote_pid_path))}.tmp; "
+        f"mv {shlex.quote(str(remote_pid_path))}.tmp "
+        f"{shlex.quote(str(remote_pid_path))}; "
+        f"{remote_script}"
     )
     try:
-        remote_pid = int(ssh(remote, detached, capture=True).stdout.strip())
+        ssh(
+            remote,
+            f"/usr/bin/screen -DmS {shlex.quote(screen_name)} "
+            f"/bin/bash -lc {shlex.quote(remote_bootstrap)}",
+        )
+        remote_pid = wait_for_remote_pid(remote, remote_pid_path)
     except Exception:
         os.killpg(local_process.pid, signal.SIGTERM)
         raise
@@ -213,6 +303,7 @@ def launch(args: argparse.Namespace) -> int:
             {
                 "rank": 1,
                 "pid": remote_pid,
+                "screen": screen_name,
                 "log": str(remote_log),
                 "exit": str(remote_exit),
             },
