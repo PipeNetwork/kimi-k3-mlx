@@ -38,6 +38,9 @@ def validate_pair(rank0: dict, rank1: dict) -> dict:
             raise ValueError(f"rank {rank} was not run from a clean worktree")
         if record.get("mlx_metal_fast_synch") != "1":
             raise ValueError(f"rank {rank} did not enable MLX_METAL_FAST_SYNCH")
+        hardware = record.get("hardware", {})
+        if not hardware.get("device_name") or not hardware.get("memory_size"):
+            raise ValueError(f"rank {rank} has incomplete hardware evidence")
 
     equal_fields = (
         "run_id",
@@ -79,6 +82,7 @@ def validate_pair(rank0: dict, rank1: dict) -> dict:
         "peak_memory_gb": max(rank0["peak_memory_gb"], rank1["peak_memory_gb"]),
         "rank_generation_tps": [rank0["generation_tps"], rank1["generation_tps"]],
         "rank_prompt_tps": [rank0["prompt_tps"], rank1["prompt_tps"]],
+        "rank_hardware": [rank0["hardware"], rank1["hardware"]],
     }
 
 

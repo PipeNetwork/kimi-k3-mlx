@@ -116,6 +116,10 @@ class TestUvmaxStage(unittest.TestCase):
             "checkpoint": {"revision": "immutable"},
             "jaccl_hostfile_sha256": "1234",
             "mlx_metal_fast_synch": "1",
+            "hardware": {
+                "device_name": "Apple M3 Ultra",
+                "memory_size": 549755813888,
+            },
             "prompt": "Hello",
             "seed": 0,
             "sampling": {"temperature": 0.0},

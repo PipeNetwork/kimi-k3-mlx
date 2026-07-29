@@ -249,6 +249,7 @@ def main() -> int:
         "%Y%m%dT%H%M%S"
     )
     host = socket.gethostname()
+    hardware = {**mx.device_info(), "machine": platform.machine()}
     print(
         f"[rank {rank}] host={host} backend=jaccl "
         f"rdma={','.join(rdma['active_ports'])} "
@@ -308,6 +309,7 @@ def main() -> int:
                 "mlx_metal_fast_synch": os.environ.get("MLX_METAL_FAST_SYNCH"),
                 "host": host,
                 "platform": platform.platform(),
+                "hardware": hardware,
                 "code": repo,
                 "versions": {"mlx": version("mlx"), "mlx_lm": version("mlx-lm")},
                 "checkpoint": manifest["source"],
