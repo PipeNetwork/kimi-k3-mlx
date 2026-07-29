@@ -334,6 +334,66 @@ class TestConverterRoundTrip(unittest.TestCase):
                          specs["mixed2"]["expert"]["bits"],
                          "both are 2-bit-expert tiers; only non-experts differ")
 
+    def test_resumable_pipeline_stage_is_transactional(self):
+        out = os.path.join(self.tmp, "stage-rank1")
+        base = [
+            sys.executable, CONVERT,
+            "--src", self.src,
+            "--out", out,
+            "--profile", "2bit",
+            "--layer-start", "0",
+            "--layer-end", "2",
+            "--stage-rank", "1",
+            "--stage-size", "2",
+            "--resume",
+        ]
+        first = subprocess.run(
+            base + ["--max-layers-this-run", "1"],
+            capture_output=True,
+            text=True,
+        )
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        self.assertIn("PAUSED", first.stdout)
+        state = json.load(open(os.path.join(out, "conversion_state.json")))
+        self.assertEqual(state["next_layer"], 1)
+        self.assertFalse(state["complete"])
+        committed = list(state["writer"]["shards"])
+        self.assertGreaterEqual(len(committed), 2)  # embedding + layer 0
+
+        second = subprocess.run(base, capture_output=True, text=True)
+        self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
+        self.assertIn("layer   1/1", second.stdout)
+        self.assertNotIn("layer   0/1", second.stdout)
+        state = json.load(open(os.path.join(out, "conversion_state.json")))
+        self.assertTrue(state["complete"])
+        self.assertEqual(state["next_layer"], 2)
+
+        cfg = json.load(open(os.path.join(out, "config.json")))
+        self.assertEqual(
+            cfg["distributed_pipeline"],
+            {
+                "backend": "jaccl",
+                "rank": 1,
+                "size": 2,
+                "layer_start": 0,
+                "layer_end": 2,
+                "source": os.path.realpath(self.src),
+                "profile": "2bit",
+            },
+        )
+        idx = json.load(open(os.path.join(out, "model.safetensors.index.json")))[
+            "weight_map"
+        ]
+        self.assertTrue(any(k.startswith("model.layers.0.") for k in idx))
+        self.assertTrue(any(k.startswith("model.layers.1.") for k in idx))
+        self.assertFalse(any(k.startswith("model.layers.2.") for k in idx))
+        self.assertFalse(any(k.startswith("model.layers.3.") for k in idx))
+        self.assertTrue(all("-of-" not in name for name in set(idx.values())))
+
+        third = subprocess.run(base, capture_output=True, text=True)
+        self.assertEqual(third.returncode, 0, third.stdout + third.stderr)
+        self.assertIn("already complete", third.stdout)
+
     def test_vision_survives_conversion_and_loads(self):
         """Vision tensors must reach the output in bf16 and load into VisionModel.
 

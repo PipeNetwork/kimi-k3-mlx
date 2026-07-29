@@ -1,0 +1,75 @@
+# Benchmarking policy
+
+Benchmarks in this project are evidence, not decoration. A result is accepted
+only when another owner of equivalent hardware can reproduce it from a commit,
+checkpoint revision, host topology, command, and machine-readable record.
+
+## Official distributed profile
+
+- Two M3 Ultra Mac Studios, 512 GiB unified memory each.
+- Direct Thunderbolt 5 RDMA connection.
+- JACCL backend; TCP ring and Ethernet results must be labeled development-only.
+- MLX 0.32.0 and mlx-lm 0.31.3 from `uv.lock`.
+- `kernelpool/Kimi-K3-2bit-UVMAX` revision
+  `edb5113218df612f4a92f95145680f3f8eacd375`.
+- Pipeline rank 1 `[0,47)` and rank 0 `[47,93)`.
+- `MLX_METAL_FAST_SYNCH=1` (set by `scripts/run_distributed.sh`).
+- Deterministic sampling (`temperature=0`, seed 0) unless the result explicitly
+  studies another sampler.
+
+## Required procedure
+
+1. Reboot or record significant concurrent workloads; stop unrelated model
+   servers. Do not purge filesystem cache between normal interactive runs.
+2. Confirm both RDMA ports are active and save the JACCL topology/hostfile.
+3. Run one 32-token warm-up to compile kernels and fault/wire weights.
+4. Run at least three prompts representing factual prose, code, and long-form
+   reasoning. Generate 256 tokens or to EOS, whichever comes first.
+5. Repeat the prompt set three times. Report the median decode tok/s and the
+   complete range; retain every JSON record.
+6. Record prompt tok/s, decode tok/s, prompt/generated token counts, peak memory,
+   load time, checkpoint revision, code commit, OS build, and exact MLX versions.
+
+Example:
+
+```bash
+scripts/run_distributed.sh \
+  --run-id "$(git rev-parse --short HEAD)-factual-1" \
+  --prompt 'Who is Albert Einstein?' \
+  --max-tokens 256
+```
+
+The runner writes `work/benchmarks/<run-id>-rank<rank>.json` locally on each
+host. Copy rank 1's record back before summarizing a run. Never hand-copy just a
+tok/s number into a pull request.
+
+## Correctness gates
+
+A faster run is rejected if any of these fail:
+
+- Stage provenance or byte-size validation.
+- Tiny-model bit-exact prefill/decode parity.
+- Deterministic output agreement between ranks.
+- Coherent full-model smoke output.
+- No JACCL/RDMA proof in the launch log.
+- OOM, page-fault thrashing, truncated generation, or changed checkpoint.
+
+Use `mlx_lm.stream_generate`, which enters mlx-lm's wired-memory context. The
+upstream project previously demonstrated why a hand-written loop can understate
+decode by roughly 27x when weights are repeatedly faulted from SSD.
+
+## Performance work
+
+Every optimization pull request must include:
+
+- Before/after JSON records from the same commit parent, prompt set, and stage.
+- Median and range, not the best run.
+- A correctness test that would fail if the optimization changed outputs.
+- Peak-memory and prompt-throughput changes, even when optimizing decode.
+- An explanation of communication volume and synchronization count when the
+  change touches distributed code.
+
+Prefer optimizations that reduce bytes read or JACCL synchronization without
+changing checkpoint quality. Keep experimental tensor/expert parallel results
+separate from the pipeline baseline until their node-local checkpoint format is
+reproducible within the internal SSD budget.

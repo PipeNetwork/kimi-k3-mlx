@@ -50,6 +50,27 @@ PASSTHROUGH_FILES = [
     "kimi_k3_vision_processing.py", "media_utils.py", "encoding_k3.py",
 ]
 
+SOURCE_METADATA_FILES = [
+    "config.json",
+    "model.safetensors.index.json",
+    *PASSTHROUGH_FILES,
+]
+
+
+def prepare_hf_source(repo_id: str, src: str):
+    """Fetch configuration/tokenizer files but no weight shards."""
+    from huggingface_hub import snapshot_download
+
+    os.makedirs(src, exist_ok=True)
+    snapshot_download(repo_id, local_dir=src, allow_patterns=SOURCE_METADATA_FILES)
+
+
+def atomic_json(path: str, value: Dict):
+    partial = path + ".partial"
+    with open(partial, "w") as f:
+        json.dump(value, f, indent=2)
+    os.replace(partial, path)
+
 
 # --------------------------------------------------------------- profiles
 
@@ -122,23 +143,61 @@ def classify(path: str) -> str:
 
 
 class ShardReader:
-    """mmap-backed shard access with a tiny LRU so we touch each file once."""
+    """mmap-backed source access with optional on-demand Hub downloads.
 
-    def __init__(self, src: str, index: Dict[str, str], keep: int = 3):
+    A streamed reader keeps only ``keep`` source shards.  Evicted files that it
+    downloaded itself are deleted after their arrays leave the LRU, bounding
+    source-checkpoint disk use to roughly ``keep * 17 GB``.  Pre-existing local
+    shards are never deleted.
+    """
+
+    def __init__(
+        self,
+        src: str,
+        index: Dict[str, str],
+        keep: int = 3,
+        hf_repo: Optional[str] = None,
+        evict_downloads: bool = False,
+    ):
         self.src = src
         self.index = index
         self.keep = keep
+        self.hf_repo = hf_repo
+        self.evict_downloads = evict_downloads
         self._open: Dict[str, Dict[str, mx.array]] = {}
         self._order: List[str] = []
+        self._downloaded = set()
+
+    def _path(self, name: str) -> str:
+        path = os.path.join(self.src, name)
+        if os.path.exists(path):
+            return path
+        if not self.hf_repo:
+            raise FileNotFoundError(path)
+        from huggingface_hub import hf_hub_download
+
+        print(f"[source] downloading {self.hf_repo}/{name}", flush=True)
+        path = hf_hub_download(self.hf_repo, name, local_dir=self.src)
+        self._downloaded.add(name)
+        return path
+
+    def _evict(self, name: str):
+        self._open.pop(name, None)
+        gc.collect()
+        if self.evict_downloads and name in self._downloaded:
+            path = os.path.join(self.src, name)
+            if os.path.exists(path):
+                os.unlink(path)
+            self._downloaded.remove(name)
+            print(f"[source] evicted {name}", flush=True)
 
     def _shard(self, name: str) -> Dict[str, mx.array]:
         if name not in self._open:
-            self._open[name] = mx.load(os.path.join(self.src, name))
+            self._open[name] = mx.load(self._path(name))
             self._order.append(name)
             while len(self._order) > self.keep:
                 old = self._order.pop(0)
-                self._open.pop(old, None)
-                gc.collect()
+                self._evict(old)
         return self._open[name]
 
     def get(self, key: str) -> mx.array:
@@ -147,56 +206,92 @@ class ShardReader:
     def has(self, key: str) -> bool:
         return key in self.index
 
+    def close(self):
+        for name in list(self._order):
+            self._evict(name)
+        self._order.clear()
+
 
 # ------------------------------------------------------------- output writer
 
 
 class ShardWriter:
-    def __init__(self, out: str, limit: int = SHARD_BYTES):
+    def __init__(
+        self,
+        out: str,
+        limit: int = SHARD_BYTES,
+        transactional: bool = False,
+        state: Optional[Dict] = None,
+    ):
         self.out = out
         self.limit = limit
+        self.transactional = transactional
         self.buf: Dict[str, mx.array] = {}
         self.nbytes = 0
         self.shards: List[Tuple[str, List[str]]] = []
         self.weight_map: Dict[str, str] = {}
         self.total = 0
         os.makedirs(out, exist_ok=True)
+        if state:
+            self.shards = [(name, keys) for name, keys in state["shards"]]
+            self.total = int(state["total"])
+            for name, keys in self.shards:
+                if not os.path.exists(os.path.join(out, name)):
+                    raise FileNotFoundError(f"committed output shard missing: {name}")
+                for key in keys:
+                    self.weight_map[key] = name
 
     def add(self, key: str, val: mx.array):
         mx.eval(val)
         self.buf[key] = val
         self.nbytes += val.nbytes
         self.total += val.nbytes
-        if self.nbytes >= self.limit:
+        if not self.transactional and self.nbytes >= self.limit:
             self.flush()
 
     def flush(self):
         if not self.buf:
             return
         name = f"model-{len(self.shards) + 1:05d}.safetensors"
-        mx.save_safetensors(os.path.join(self.out, name), self.buf, {"format": "mlx"})
+        path = os.path.join(self.out, name)
+        # MLX appends .safetensors when the supplied name has another suffix.
+        # Keep the temporary name ending in .safetensors so os.replace sees the
+        # exact file we asked it to create.
+        partial = path + ".partial.safetensors"
+        mx.save_safetensors(partial, self.buf, {"format": "mlx"})
+        os.replace(partial, path)
         for k in self.buf:
             self.weight_map[k] = name
         self.shards.append((name, list(self.buf)))
         self.buf, self.nbytes = {}, 0
         gc.collect()
 
-    def finalize(self):
+    def state(self) -> Dict:
+        if self.buf:
+            raise RuntimeError("flush before recording ShardWriter state")
+        return {"shards": self.shards, "total": self.total}
+
+    def finalize(self, conventional_names: bool = True):
         self.flush()
         n = len(self.shards)
-        # rename to the conventional -of-NNNNN form now that the count is known
-        remap = {}
-        for i, (old, keys) in enumerate(self.shards, 1):
-            new = f"model-{i:05d}-of-{n:05d}.safetensors"
-            os.rename(os.path.join(self.out, old), os.path.join(self.out, new))
-            remap[old] = new
-        self.weight_map = {k: remap[v] for k, v in self.weight_map.items()}
-        with open(os.path.join(self.out, "model.safetensors.index.json"), "w") as f:
+        if conventional_names:
+            # Rename only non-resumable builds.  A streamed stage keeps stable
+            # names so a crash during finalization cannot invalidate its journal.
+            remap = {}
+            for i, (old, keys) in enumerate(self.shards, 1):
+                new = f"model-{i:05d}-of-{n:05d}.safetensors"
+                os.rename(os.path.join(self.out, old), os.path.join(self.out, new))
+                remap[old] = new
+            self.weight_map = {k: remap[v] for k, v in self.weight_map.items()}
+        index_path = os.path.join(self.out, "model.safetensors.index.json")
+        index_partial = index_path + ".partial"
+        with open(index_partial, "w") as f:
             json.dump(
                 {"metadata": {"total_size": self.total}, "weight_map": self.weight_map},
                 f,
                 indent=2,
             )
+        os.replace(index_partial, index_path)
 
 
 # ------------------------------------------------------------- quantization
@@ -351,11 +446,71 @@ def convert(
     prune_plan: Optional[str] = None,
     nonexpert_bits: Optional[int] = None,
     awq_scales: Optional[str] = None,
+    layer_start: int = 0,
+    layer_end: Optional[int] = None,
+    hf_repo: Optional[str] = None,
+    evict_source_shards: bool = False,
+    resume: bool = False,
+    stage_rank: Optional[int] = None,
+    stage_size: Optional[int] = None,
+    max_layers_this_run: Optional[int] = None,
 ):
+    if hf_repo:
+        prepare_hf_source(hf_repo, src)
     spec = profile_spec(profile, nonexpert_bits)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
     args = kimi_k3.ModelArgs.from_dict(raw_cfg)
     index = json.load(open(os.path.join(src, "model.safetensors.index.json")))["weight_map"]
+    if limit_layers is not None:
+        if layer_end is not None:
+            raise SystemExit("--limit-layers and --layer-end are mutually exclusive")
+        layer_end = limit_layers
+    layer_end = args.num_hidden_layers if layer_end is None else layer_end
+    if not 0 <= layer_start < layer_end <= args.num_hidden_layers:
+        raise SystemExit(
+            f"invalid layer range [{layer_start}, {layer_end}) for "
+            f"{args.num_hidden_layers} layers"
+        )
+    if (stage_rank is None) != (stage_size is None):
+        raise SystemExit("--stage-rank and --stage-size must be provided together")
+    if stage_rank is not None:
+        expected = kimi_k3.pipeline_bounds(args.num_hidden_layers, stage_size, stage_rank)
+        if expected != (layer_start, layer_end):
+            raise SystemExit(
+                f"rank {stage_rank}/{stage_size} must own layers {expected}, got "
+                f"[{layer_start}, {layer_end})"
+            )
+
+    signature = {
+        "version": 1,
+        "source": hf_repo or os.path.realpath(src),
+        "profile": profile,
+        "nonexpert_bits": nonexpert_bits,
+        "awq_scales": os.path.realpath(awq_scales) if awq_scales else None,
+        "prune_plan": os.path.realpath(prune_plan) if prune_plan else None,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
+        "stage_rank": stage_rank,
+        "stage_size": stage_size,
+    }
+    state_path = os.path.join(out, "conversion_state.json")
+    saved = None
+    if resume and os.path.exists(state_path):
+        saved = json.load(open(state_path))
+        if saved.get("signature") != signature:
+            raise SystemExit("resume signature does not match existing conversion_state.json")
+        if saved.get("complete"):
+            print(f"[{profile}] already complete -> {out}")
+            return
+    elif resume and os.path.isdir(out):
+        leftovers = [
+            name for name in os.listdir(out)
+            if name.endswith((".safetensors", ".partial"))
+        ]
+        if leftovers:
+            raise SystemExit(
+                f"refusing unjournaled output in {out}: {leftovers[:3]}"
+            )
     awq = None
     if awq_scales:
         _z = __import__("numpy").load(awq_scales)
@@ -398,11 +553,41 @@ def convert(
               f"experts per layer (mean {sum(kept)/len(kept):.0f}, "
               f"{sum(kept)/(len(kept)*args.num_experts):.1%})")
 
-    reader = ShardReader(src, index)
-    writer = ShardWriter(out)
-    overrides: Dict[str, Dict] = {}
-    n_layers = limit_layers or args.num_hidden_layers
+    reader = ShardReader(
+        src,
+        index,
+        keep=1 if evict_source_shards else 3,
+        hf_repo=hf_repo,
+        evict_downloads=evict_source_shards,
+    )
+    writer = ShardWriter(
+        out,
+        transactional=resume,
+        state=saved.get("writer") if saved else None,
+    )
+    overrides: Dict[str, Dict] = dict(saved.get("overrides", {})) if saved else {}
+    embedding_done = bool(saved.get("embedding_done", False)) if saved else False
+    common_done = bool(saved.get("common_done", False)) if saved else False
+    next_layer = int(saved.get("next_layer", layer_start)) if saved else layer_start
+    converted_this_run = 0
     t0 = time.time()
+
+    def checkpoint(*, embedding_done, next_layer, common_done, complete=False):
+        if not resume:
+            return
+        writer.flush()
+        atomic_json(
+            state_path,
+            {
+                "signature": signature,
+                "embedding_done": embedding_done,
+                "next_layer": next_layer,
+                "common_done": common_done,
+                "complete": complete,
+                "overrides": overrides,
+                "writer": writer.state(),
+            },
+        )
 
     def emit(module_path: str, tensors: Dict[str, mx.array]):
         for suffix, val in tensors.items():
@@ -415,12 +600,19 @@ def convert(
             overrides[module_path] = dict(s)
 
     # ---- embeddings
-    emb = reader.get("language_model.model.embed_tokens.weight")
-    emit_quantized("model.embed_tokens", emb, "other")
-    del emb
+    if not embedding_done:
+        emb = reader.get("language_model.model.embed_tokens.weight")
+        emit_quantized("model.embed_tokens", emb, "other")
+        del emb
+        embedding_done = True
+        checkpoint(
+            embedding_done=embedding_done,
+            next_layer=next_layer,
+            common_done=common_done,
+        )
 
     # ---- layers
-    for i in range(n_layers):
+    for i in range(next_layer, layer_end):
         lt0 = time.time()
         prefix = f"language_model.model.layers.{i}"
         raw = {
@@ -506,11 +698,29 @@ def convert(
                 gc.collect()
 
         print(
-            f"[{profile}] layer {i:3d}/{n_layers - 1}  "
+            f"[{profile}] layer {i:3d}/{layer_end - 1}  "
             f"{time.time() - lt0:6.1f}s  written {writer.total / 1e9:8.1f} GB  "
             f"elapsed {(time.time() - t0) / 60:6.1f}m",
             flush=True,
         )
+        next_layer = i + 1
+        checkpoint(
+            embedding_done=embedding_done,
+            next_layer=next_layer,
+            common_done=common_done,
+        )
+        converted_this_run += 1
+        if (
+            max_layers_this_run is not None
+            and converted_this_run >= max_layers_this_run
+            and next_layer < layer_end
+        ):
+            print(
+                f"[{profile}] PAUSED after {converted_this_run} layer(s); "
+                f"resume at layer {next_layer}",
+                flush=True,
+            )
+            return
 
     # ---- vision tower + projector
     #
@@ -519,30 +729,37 @@ def convert(
     # visual pathway at risk. Keys stay in source form: kimi_k3.Model.sanitize
     # drops them (mlx-lm is text-only) and kimi_k3_vision.VisionModel.sanitize
     # consumes them, so there is exactly one place that maps these names.
-    vis_keys = sorted(
-        (k for k in index if k.startswith(("vision_tower.", "mm_projector."))),
-        key=lambda k: (index[k], k),  # group by shard so the LRU sees each once
-    )
-    n_vis = 0
-    for key in vis_keys:
-        writer.add(key, reader.get(key).astype(mx.bfloat16))
-        n_vis += 1
-    print(f"[{profile}] vision tower: {n_vis} tensors copied bf16", flush=True)
+    if not common_done:
+        vis_keys = sorted(
+            (k for k in index if k.startswith(("vision_tower.", "mm_projector."))),
+            key=lambda k: (index[k], k),  # group by shard so the LRU sees each once
+        )
+        n_vis = 0
+        for key in vis_keys:
+            writer.add(key, reader.get(key).astype(mx.bfloat16))
+            n_vis += 1
+        print(f"[{profile}] vision tower: {n_vis} tensors copied bf16", flush=True)
 
-    # ---- tail
-    for key in (
-        "language_model.model.norm.weight",
-        "language_model.model.output_attn_res_proj.weight",
-        "language_model.model.output_attn_res_norm.weight",
-    ):
-        if reader.has(key):
-            m = kimi_k3.remap_checkpoint({key: reader.get(key)}, args, layer_indices=[])
-            for k, v in m.items():
-                writer.add(k, v)
-    if not args.tie_word_embeddings:
-        emit_quantized("lm_head", reader.get("language_model.lm_head.weight"), "other")
+        # ---- tail
+        for key in (
+            "language_model.model.norm.weight",
+            "language_model.model.output_attn_res_proj.weight",
+            "language_model.model.output_attn_res_norm.weight",
+        ):
+            if reader.has(key):
+                m = kimi_k3.remap_checkpoint({key: reader.get(key)}, args, layer_indices=[])
+                for k, v in m.items():
+                    writer.add(k, v)
+        if not args.tie_word_embeddings:
+            emit_quantized("lm_head", reader.get("language_model.lm_head.weight"), "other")
+        common_done = True
+        checkpoint(
+            embedding_done=embedding_done,
+            next_layer=next_layer,
+            common_done=common_done,
+        )
 
-    writer.finalize()
+    writer.finalize(conventional_names=not resume)
 
     # ---- config + aux files
     cfg = dict(raw_cfg)
@@ -553,6 +770,16 @@ def convert(
     q = dict(spec["global_q"])
     q.update(overrides)
     cfg["quantization"] = q
+    if stage_rank is not None:
+        cfg["distributed_pipeline"] = {
+            "backend": "jaccl",
+            "rank": stage_rank,
+            "size": stage_size,
+            "layer_start": layer_start,
+            "layer_end": layer_end,
+            "source": hf_repo or os.path.realpath(src),
+            "profile": profile,
+        }
     if expert_counts is not None:
         tc = cfg.setdefault("text_config", cfg)
         tc["expert_counts"] = expert_counts
@@ -570,8 +797,7 @@ def convert(
             # check a converted expert against the source it came from.
             "keep": {str(k): v for k, v in sorted(keep_map.items())},
         }
-    with open(os.path.join(out, "config.json"), "w") as f:
-        json.dump(cfg, f, indent=2)
+    atomic_json(os.path.join(out, "config.json"), cfg)
 
     here = os.path.dirname(__file__)
     for mod in ("kimi_k3.py", "kimi_k3_vision.py"):
@@ -586,6 +812,14 @@ def convert(
         if os.path.exists(p):
             shutil.copy(p, os.path.join(out, name))
 
+    checkpoint(
+        embedding_done=embedding_done,
+        next_layer=next_layer,
+        common_done=common_done,
+        complete=True,
+    )
+    reader.close()
+
     print(f"[{profile}] DONE  {writer.total / 1e12:.3f} TB  "
           f"{len(writer.shards)} shards  {(time.time() - t0) / 60:.1f} min -> {out}")
 
@@ -598,6 +832,22 @@ if __name__ == "__main__":
                     choices=["mxfp4", "3bit", "2bit", "mixed2"])
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers (smoke testing)")
+    ap.add_argument("--layer-start", type=int, default=0,
+                    help="first decoder layer to convert (inclusive)")
+    ap.add_argument("--layer-end", type=int,
+                    help="last decoder layer to convert (exclusive)")
+    ap.add_argument("--stage-rank", type=int,
+                    help="JACCL pipeline rank this partial checkpoint serves")
+    ap.add_argument("--stage-size", type=int,
+                    help="number of JACCL pipeline ranks")
+    ap.add_argument("--hf-repo",
+                    help="download missing source shards on demand from this Hub repo")
+    ap.add_argument("--evict-source-shards", action="store_true",
+                    help="delete on-demand source shards after their LRU eviction")
+    ap.add_argument("--resume", action="store_true",
+                    help="journal each completed layer and resume safely")
+    ap.add_argument("--max-layers-this-run", type=int,
+                    help=argparse.SUPPRESS)
     ap.add_argument("--nonexpert-bits", type=int, default=None,
                     help="quantize non-expert tensors to N bits (mxfp4 profile "
                          "keeps them bf16 by default: 114 GB on K3)")
@@ -608,4 +858,20 @@ if __name__ == "__main__":
                     help="REAP plan from scripts/reap_plan.py; prunes experts "
                          "and renumbers the router to match")
     a = ap.parse_args()
-    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan, a.nonexpert_bits, a.awq_scales)
+    convert(
+        src=a.src,
+        out=a.out,
+        profile=a.profile,
+        limit_layers=a.limit_layers,
+        prune_plan=a.prune_plan,
+        nonexpert_bits=a.nonexpert_bits,
+        awq_scales=a.awq_scales,
+        layer_start=a.layer_start,
+        layer_end=a.layer_end,
+        hf_repo=a.hf_repo,
+        evict_source_shards=a.evict_source_shards,
+        resume=a.resume,
+        stage_rank=a.stage_rank,
+        stage_size=a.stage_size,
+        max_layers_this_run=a.max_layers_this_run,
+    )

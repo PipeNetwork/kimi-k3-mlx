@@ -3,8 +3,13 @@
 # The register step matters: tests import `mlx_lm.models.kimi_k3`, so editing
 # the local file without reinstalling silently tests the previous version.
 set -uo pipefail
-cd "$(dirname "$0")/.."
-PY="${PY:-python3}"
+cd "$(dirname "$0")/.." || exit 1
+if [ -x .venv/bin/python ]; then
+  DEFAULT_PY=.venv/bin/python
+else
+  DEFAULT_PY=python3
+fi
+PY="${PY:-$DEFAULT_PY}"
 scripts/install_model.sh "$PY" >/dev/null
 # A suite that produces no result must FAIL, not pass quietly. This used to
 # grep for ^Ran/^OK/^FAILED and test only for the word FAILED, so anything that

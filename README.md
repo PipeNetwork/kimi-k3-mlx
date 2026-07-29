@@ -1,4 +1,24 @@
-# kimi-k3-mlx
+# Kimi-K3 MLX Distributed
+
+This is a real GitHub fork of
+[PipeNetwork/kimi-k3-mlx](https://github.com/PipeNetwork/kimi-k3-mlx), focused
+on the fastest reproducible **unpruned Kimi-K3 inference across two 512 GiB M3
+Ultra Mac Studios**. The deployment path is deliberately strict: Thunderbolt
+RDMA and MLX's JACCL backend are mandatory; the production runner refuses a TCP
+ring fallback.
+
+The preferred checkpoint is
+[kernelpool/Kimi-K3-2bit-UVMAX](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX),
+a 816.77 GB mixed-precision MLX build whose 2.72T routed-expert parameters are
+2-bit. It keeps the quality-sensitive attention, shared experts, routers, and
+embeddings at 4–8 bits while fitting as two balanced local stages. The original
+883 GB uniform 2-bit streaming conversion remains supported as the fully
+reproducible build path.
+
+Current distributed work, exact storage, cabling, and commands are documented
+in [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md). Benchmark submissions must follow
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md), and contributions follow
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 MLX (Apple Silicon) port of [**moonshotai/Kimi-K3**](https://huggingface.co/moonshotai/Kimi-K3) —
 Moonshot's 2.78T-total / 104B-active native-multimodal MoE, built on Kimi Delta
@@ -10,9 +30,10 @@ the mlx-vlm wrapper that joins them.
 `scripts/convert.py` is a streaming converter — `mlx_lm convert` cannot be used
 here, because it materialises the whole model and K3 is 5.6 TB in bf16.
 
-> **Read this before planning a deployment.** Nothing in this repo runs on a
-> single Mac. The smallest tier is ~870 GB against a 512 GB ceiling on the
-> largest Apple Silicon machine that exists. See [Reality check](#reality-check).
+> **Read this before planning a deployment.** The unpruned model does not fit
+> one Mac. This fork partitions it across two 512 GiB M3 Ultras; the upstream
+> pruned checkpoints remain the right choice for single-machine inference. See
+> [Reality check](#reality-check).
 
 ## Architecture
 
@@ -242,18 +263,21 @@ Two things the numbers say that the earlier text got backwards:
 
 ## Reality check
 
-**No *unpruned* tier is runnable on any Apple Silicon machine.** Peak unified
-memory tops out at 512 GB (M3 Ultra Mac Studio); the smallest full tier here is
-883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
-[REAP pruning](#reap-expert-pruning) exists to solve — the pruned builds in
-[Published](#published) do fit, and do run.
+**No unpruned tier is runnable on one Apple Silicon machine.** Peak unified
+memory tops out at 512 GB (M3 Ultra Mac Studio); the original smallest full tier
+is 883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
+[REAP pruning](#reap-expert-pruning) exists to solve for one Mac. This fork's
+second route is a two-machine pipeline: the 816.77 GB UVMAX checkpoint becomes
+384.301 GiB on rank 0 and 384.462 GiB on rank 1, including duplicated embedding
+and output tensors required by released mlx-lm generation.
 
 Consequences, stated plainly:
 
-- The **unpruned tiers** have never produced a token. No perplexity, no
-  generation, no smoke test — that is not a shortcut taken, it is arithmetically
-  impossible on this hardware. Every measured number in this file comes from a
-  REAP-pruned build.
+- In the original single-node work, the **unpruned tiers** had never produced a
+  token because they cannot fit one M3 Ultra. Do not reinterpret the upstream
+  single-node benchmark table as a distributed result. Two-node results in this
+  fork are recorded separately under `work/benchmarks/` and only promoted to
+  this README after a reproducible JACCL run.
 - What *is* verified for them: bit-exactness of the mxfp4 tier against the
   source, 100% checkpoint-key coverage over all 497,220 tensors, prefill/decode
   agreement of the architecture at small scale, and per-expert cosine similarity
@@ -268,7 +292,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers kimi_k3.py, runs all 76 tests
+scripts/test_all.sh                     # registers both loaders, runs all 82 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -277,12 +301,13 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | suite | what it covers | |
 |---|---|---|
 | `test_prune_apply.py` | REAP plan application + router renumbering | 18 |
-| `test_kimi_k3.py` | architecture + 497,220-key coverage | 17 |
+| `test_kimi_k3.py` | architecture + 497,220-key coverage | 19 |
 | `test_vl_wrapper.py` | placeholder expansion + multimodal path | 11 |
 | `test_reap.py` | saliency accumulation and planning modes | 10 |
 | `test_vision_parity.py` | vision tower vs torch reference | 9 |
 | `test_processor_integration.py` | real processor -> MLX tower | 7 |
-| `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 4 |
+| `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
+| `test_uvmax.py` | stable loader + rank-local selection + odd pipeline split | 3 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -604,13 +629,34 @@ print("registered kimi_k3 ->", dst)
 PY
 ```
 
+For the unpruned two-node deployment, use the pinned environment and rank-local
+checkpoint builder instead:
+
+```bash
+uv sync --frozen
+scripts/install_model.sh .venv/bin/python
+
+# Beast1 is rank 0; run rank 1 on Beast2 in parallel.
+.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0
+ssh beast2.local 'cd ~/dev/kimi-k3-mlx-distributed && \
+  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1'
+
+# After connecting Thunderbolt 5 and confirming RDMA is active:
+scripts/configure_jaccl.sh
+scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
+```
+
+`scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
+mode and requires exactly two ranks. A missing RDMA/JACCL fabric is an error,
+not a performance-degrading fallback.
+
 ## Status
 
 - [x] text architecture port (`kimi_k3.py`)
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 76/76 tests passing
+- [x] 82 tests discovered: 75 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
@@ -618,6 +664,11 @@ PY
 - [x] publish to `pipenetwork/` (4 tiers)
 - [x] **held-out perplexity** (`scripts/perplexity.py`), bucketed per source
 - [x] AWQ implemented and measured — [small, fragile, domain-skewed](#awq-on-the-2-bit-experts--measured)
+- [x] latest stable MLX 0.32.0 + mlx-lm 0.31.3 environment pinned by `uv.lock`
+- [x] resumable 47/46-layer rank-local UVMAX downloader (about 384.5 GiB/rank)
+- [x] exact two-rank prefill and cached-decode parity on a miniature K3
+- [x] production runner hard-requires JACCL and two ranks
+- [ ] full unpruned two-M3-Ultra JACCL generation and benchmark proof
 - [ ] AWQ re-run on a balanced calibration corpus (in progress)
 - [ ] tok/s re-measured for all published tiers after the wiring fix
 
@@ -634,3 +685,12 @@ carry the upstream licence too; `scripts/convert.py` copies it into every tier.
 
 Everything outside `reference/` — `kimi_k3.py`, `kimi_k3_vision.py`,
 `kimi_k3_vl/`, `scripts/`, `tests/` — is this port.
+
+Distributed additions in this fork retain and credit that work. The UVMAX
+loader is based on Tarjei Mandt's
+[mlx-lm PR #1626](https://github.com/ml-explore/mlx-lm/pull/1626), pinned to
+commit `7d505c285b801108a52c23353c7fb6af07204717` and kept under mlx-lm's MIT
+terms. The UVMAX weights remain under Moonshot's Kimi K3 license. See
+[NOTICE.md](NOTICE.md) for the file-by-file provenance and licensing caveat:
+the fork point did not include a top-level software license, so inherited code
+cannot be retroactively relicensed by this fork.

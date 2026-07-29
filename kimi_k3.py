@@ -38,6 +38,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_kernel, gated_delta_ops
 from .mla import MultiLinear
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -693,6 +694,23 @@ def bank_split_in_layer(args: ModelArgs, idx: int) -> int:
     return int(args.expert_bank_split[idx])
 
 
+def pipeline_bounds(num_layers: int, size: int, rank: int) -> tuple[int, int]:
+    """Return this rank's half-open decoder-layer range.
+
+    MLX pipelines execute from the highest rank to rank 0.  Remainder layers
+    therefore go to the input side.  For K3 on two ranks this yields [0, 47)
+    and [47, 93): the dense layer plus 46 MoE layers on the input rank, and 46
+    MoE layers on the output rank.
+    """
+    if size < 1 or not 0 <= rank < size:
+        raise ValueError(f"invalid pipeline size/rank: size={size}, rank={rank}")
+    logical_stage = size - rank - 1
+    base, extra = divmod(num_layers, size)
+    counts = [base + (stage < extra) for stage in range(size)]
+    start = sum(counts[:logical_stage])
+    return start, start + counts[logical_stage]
+
+
 def remap_checkpoint(
     weights: Dict[str, mx.array],
     args: ModelArgs,
@@ -854,7 +872,7 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum + z, block_residual
 
 
-class KimiK3Model(nn.Module):
+class KimiK3Model(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -864,6 +882,7 @@ class KimiK3Model(nn.Module):
 
         self.use_attn_res = args.attn_res_block_size is not None
         if self.use_attn_res:
+            self.attn_res_block_size = args.attn_res_block_size
             self.output_attn_res = AttnResProj(args.hidden_size)
 
         kda_layers = args.linear_attn_config["kda_layers"]
@@ -871,6 +890,41 @@ class KimiK3Model(nn.Module):
         self.attn_idx = next(
             i for i in range(len(self.layers)) if (i + 1) not in kda_layers
         )
+
+    def pipeline(self, group):
+        """Partition complete decoder layers across a reverse MLX pipeline.
+
+        Rank ``size - 1`` owns the input stage and rank 0 owns the output
+        stage, matching MLX-LM's pipeline protocol.  Put remainder layers on
+        the input side: K3's only dense layer is layer 0, so with two ranks the
+        93-layer model becomes 47 layers (one dense + 46 MoE) followed by 46
+        MoE layers.  That balances the expensive expert weights exactly.
+
+        This computes explicit prefix sums instead of the generic mixin's
+        rank-local multiplication.  The latter leaves a gap for an odd layer
+        count when ranks have different partition sizes.
+        """
+        self.pipeline_rank = group.rank()
+        self.pipeline_size = group.size()
+        self.start_idx, self.end_idx = pipeline_bounds(
+            len(self.layers), self.pipeline_size, self.pipeline_rank
+        )
+        self.layers = self.layers[: self.end_idx]
+        # Keep original layer numbers in parameter names and checkpoint keys.
+        self.layers[: self.start_idx] = [None] * self.start_idx
+
+    def _pipeline_masks(self, h, cache):
+        ssm_cache = attn_cache = None
+        for layer, layer_cache in zip(self.pipeline_layers, cache):
+            if layer.is_linear and ssm_cache is None:
+                ssm_cache = layer_cache
+            elif not layer.is_linear and attn_cache is None:
+                attn_cache = layer_cache
+            if ssm_cache is not None and attn_cache is not None:
+                break
+        ssm_mask = create_ssm_mask(h, ssm_cache)
+        attn_mask = create_attention_mask(h, attn_cache, return_array=True)
+        return ssm_mask, attn_mask
 
     def __call__(
         self,
@@ -881,23 +935,61 @@ class KimiK3Model(nn.Module):
         # inputs_embeds lets the multimodal wrapper splice image features in
         # place of the <|media_pad|> placeholder before the stack runs.
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        pipeline_rank = self.pipeline_rank
+        pipeline_size = self.pipeline_size
+        local_layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
-
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-        attn_mask = create_attention_mask(h, cache[self.attn_idx], return_array=True)
+            cache = [None] * len(local_layers)
+        if len(cache) != len(local_layers):
+            raise ValueError(
+                f"cache has {len(cache)} entries for {len(local_layers)} local layers"
+            )
 
         B, T, H = h.shape
-        block_residual = mx.zeros((B * T, 0, H), dtype=h.dtype) if self.use_attn_res else None
+        block_residual = None
+        if self.use_attn_res:
+            previous_blocks = (
+                (self.start_idx + self.attn_res_block_size - 1)
+                // self.attn_res_block_size
+            )
+            block_residual = mx.zeros(
+                (B * T, previous_blocks, H), dtype=h.dtype
+            )
 
-        for layer, layer_cache in zip(self.layers, cache):
+        # The input stage has the highest rank.  Later stages first receive the
+        # hidden state and K3's cross-layer AttnRes accumulator from that rank.
+        if pipeline_rank < pipeline_size - 1:
+            h = mx.distributed.recv_like(h, pipeline_rank + 1)
+            if self.use_attn_res:
+                block_residual = mx.distributed.recv_like(
+                    block_residual, pipeline_rank + 1
+                )
+
+        ssm_mask, attn_mask = self._pipeline_masks(h, cache)
+
+        for layer, layer_cache in zip(local_layers, cache):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, block_residual = layer(h, mask, layer_cache, block_residual)
 
-        if self.use_attn_res:
+        # Only rank 0 has traversed the complete stack and may apply the final
+        # AttnRes projection.  Earlier ranks forward both live tensors.
+        if pipeline_rank == 0 and self.use_attn_res:
             h = self.output_attn_res(
                 h.reshape(-1, H), block_residual, self.args.rms_norm_eps
             ).reshape(B, T, H)
+
+        if pipeline_rank != 0:
+            h = mx.distributed.send(h, pipeline_rank - 1)
+            if self.use_attn_res:
+                sent_residual = mx.distributed.send(
+                    block_residual, pipeline_rank - 1
+                )
+                h = mx.depends(h, sent_residual)
+
+        # All ranks participate in token sampling.  Rank 0's completed hidden
+        # state is the first slice of the rank-ordered gather.
+        if pipeline_size > 1:
+            h = mx.distributed.all_gather(h)[:B]
         return self.norm(h)
 
 
@@ -926,7 +1018,7 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [

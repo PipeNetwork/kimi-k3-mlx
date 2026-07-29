@@ -220,6 +220,39 @@ class TestForward(unittest.TestCase):
         self.assertFalse(bool(mx.any(mx.isnan(out))))
 
 
+class TestPipelinePartition(unittest.TestCase):
+    class Group:
+        def __init__(self, rank, size):
+            self._rank, self._size = rank, size
+
+        def rank(self):
+            return self._rank
+
+        def size(self):
+            return self._size
+
+    def test_real_k3_two_rank_split_is_complete_and_moe_balanced(self):
+        ranges = [kimi_k3.pipeline_bounds(93, 2, rank) for rank in range(2)]
+        self.assertEqual(ranges, [(47, 93), (0, 47)])
+        covered = [i for start, end in ranges for i in range(start, end)]
+        self.assertEqual(sorted(covered), list(range(93)))
+        self.assertEqual(len(covered), len(set(covered)))
+        # Layer 0 is dense; both stages own exactly 46 MoE layers.
+        self.assertEqual(ranges[0][1] - ranges[0][0], 46)
+        self.assertEqual(ranges[1][1] - ranges[1][0] - 1, 46)
+
+    def test_model_keeps_original_checkpoint_layer_numbers(self):
+        parts = []
+        for rank in range(2):
+            model = kimi_k3.KimiK3Model(tiny_args())
+            model.pipeline(self.Group(rank, 2))
+            indices = [layer.layer_idx for layer in model.pipeline_layers]
+            parts.extend(indices)
+            self.assertEqual(indices, list(range(model.start_idx, model.end_idx)))
+            self.assertTrue(all(layer is None for layer in model.layers[: model.start_idx]))
+        self.assertEqual(sorted(parts), list(range(6)))
+
+
 class TestCheckpointCoverage(unittest.TestCase):
     """Every one of the 497,220 checkpoint tensors must land somewhere."""
 
