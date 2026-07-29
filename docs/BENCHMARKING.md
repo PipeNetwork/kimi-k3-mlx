@@ -52,7 +52,16 @@ scripts/run_distributed.sh \
 
 The runner writes `work/benchmarks/<run-id>-rank<rank>.json` locally on each
 host, plus a summary containing median/range. Copy rank 1's records back before
-summarizing a run. Never hand-copy just a tok/s number into a pull request.
+summarizing a run, then validate both ranks and produce the system result:
+
+```bash
+scripts/summarize_benchmark.py "$(git rev-parse --short HEAD)-canonical"
+```
+
+The validator rejects dirty/mismatched commits, divergent output, missing
+active-RDMA evidence, a missing JACCL hostfile hash, or a disabled MLX fast-sync
+setting. It conservatively uses the slower rank's observed throughput for each
+paired generation. Never hand-copy just a tok/s number into a pull request.
 
 ## Correctness gates
 

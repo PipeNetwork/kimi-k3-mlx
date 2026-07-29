@@ -11,8 +11,9 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mlx_lm.models import kimi_k3_uvmax
-from scripts.distributed_generate import benchmark_cases
+from scripts.distributed_generate import benchmark_cases, parse_active_rdma_ports
 from scripts.prepare_uvmax_stage import pipeline_bounds, select_stage_files
+from scripts.summarize_benchmark import validate_pair
 
 
 def tiny_config(num_layers=5):
@@ -72,6 +73,61 @@ class FakeGroup:
 
 
 class TestUvmaxStage(unittest.TestCase):
+    def test_paired_benchmark_validation(self):
+        base = {
+            "run_id": "test-factual-r1",
+            "suite_run_id": "test",
+            "case_id": "factual",
+            "repetition": 1,
+            "world_size": 2,
+            "backend": "jaccl",
+            "transport": "thunderbolt-rdma",
+            "rdma": {"active_ports": ["rdma_en3"]},
+            "code": {"commit": "abc", "dirty": False},
+            "versions": {"mlx": "0.32.0", "mlx_lm": "0.31.3"},
+            "checkpoint": {"revision": "immutable"},
+            "jaccl_hostfile_sha256": "1234",
+            "mlx_metal_fast_synch": "1",
+            "prompt": "Hello",
+            "seed": 0,
+            "sampling": {"temperature": 0.0},
+            "max_tokens": 8,
+            "prompt_tokens": 2,
+            "generation_tokens": 8,
+            "text": "world",
+            "prompt_tps": 5.0,
+            "generation_tps": 3.0,
+            "peak_memory_gb": 400.0,
+        }
+        rank0 = {**base, "rank": 0, "host": "beast1"}
+        rank1 = {
+            **base,
+            "rank": 1,
+            "host": "beast2",
+            "prompt_tps": 4.5,
+            "generation_tps": 2.9,
+            "peak_memory_gb": 401.0,
+        }
+        result = validate_pair(rank0, rank1)
+        self.assertEqual(result["generation_tps"], 2.9)
+        self.assertEqual(result["prompt_tps"], 4.5)
+        self.assertEqual(result["peak_memory_gb"], 401.0)
+
+        rank1["text"] = "different"
+        with self.assertRaisesRegex(ValueError, "text"):
+            validate_pair(rank0, rank1)
+
+    def test_active_rdma_port_parser(self):
+        output = """
+        hca_id:\trdma_en2
+            state:\t\t\tPORT_DOWN (1)
+        hca_id:\trdma_en3
+            state:\t\t\tPORT_ACTIVE (4)
+        hca_id:\trdma_en4
+            state:\t\t\tPORT_ACTIVE (4)
+        """
+        self.assertEqual(parse_active_rdma_ports(output), ["rdma_en3", "rdma_en4"])
+
     def test_benchmark_suite_validation(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "suite.json"

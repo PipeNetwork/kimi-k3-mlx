@@ -13,6 +13,7 @@ test -f "$HOSTFILE" || {
     echo "Missing $HOSTFILE; run scripts/configure_jaccl.sh after connecting Thunderbolt 5." >&2
     exit 1
 }
+HOSTFILE_SHA256="$(shasum -a 256 "$HOSTFILE" | awk '{print $1}')"
 
 scripts/install_model.sh "$PYTHON"
 ssh -o BatchMode=yes "$REMOTE_HOST" \
@@ -25,5 +26,6 @@ KIMI_RUN_ID="$RUN_ID" "$REPO_DIR/.venv/bin/mlx.launch" \
     --cwd "$REPO_DIR" \
     --python "$PYTHON" \
     --env MLX_METAL_FAST_SYNCH=1 \
+    --env KIMI_HOSTFILE_SHA256="$HOSTFILE_SHA256" \
     --env KIMI_RUN_ID="$RUN_ID" \
     -- "$PYTHON" scripts/distributed_generate.py "$@"

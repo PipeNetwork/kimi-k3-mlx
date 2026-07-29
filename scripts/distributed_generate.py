@@ -21,6 +21,34 @@ from mlx_lm.utils import load_model, load_tokenizer
 from mlx.utils import tree_flatten
 
 
+def parse_active_rdma_ports(output: str) -> list[str]:
+    """Extract active HCA names from macOS ``ibv_devinfo`` output."""
+    active = []
+    hca = None
+    for line in output.splitlines():
+        key, separator, value = line.strip().partition(":")
+        if not separator:
+            continue
+        if key == "hca_id":
+            hca = value.strip()
+        elif key == "state" and "PORT_ACTIVE" in value and hca:
+            active.append(hca)
+    return active
+
+
+def rdma_state() -> dict:
+    try:
+        output = subprocess.check_output(
+            ["/usr/bin/ibv_devinfo"], text=True, stderr=subprocess.STDOUT
+        )
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise RuntimeError(f"cannot inspect macOS RDMA devices: {error}") from error
+    active = parse_active_rdma_ports(output)
+    if not active:
+        raise RuntimeError("JACCL run has no locally active Thunderbolt RDMA port")
+    return {"active_ports": active}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -207,6 +235,7 @@ def main() -> int:
     rank, size = group.rank(), group.size()
     if size != 2:
         raise RuntimeError(f"this deployment requires exactly two JACCL ranks, got {size}")
+    rdma = rdma_state()
 
     model_root = args.model_root.resolve()
     stage = model_root / f"rank{rank}"
@@ -217,6 +246,7 @@ def main() -> int:
     host = socket.gethostname()
     print(
         f"[rank {rank}] host={host} backend=jaccl "
+        f"rdma={','.join(rdma['active_ports'])} "
         f"layers=[{manifest['pipeline']['layer_start']},"
         f"{manifest['pipeline']['layer_end']}) stage={stage}",
         flush=True,
@@ -268,6 +298,9 @@ def main() -> int:
                 "world_size": size,
                 "backend": "jaccl",
                 "transport": "thunderbolt-rdma",
+                "rdma": rdma,
+                "jaccl_hostfile_sha256": os.environ.get("KIMI_HOSTFILE_SHA256"),
+                "mlx_metal_fast_synch": os.environ.get("MLX_METAL_FAST_SYNCH"),
                 "host": host,
                 "platform": platform.platform(),
                 "code": repo,
