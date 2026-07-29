@@ -56,7 +56,9 @@ def transfer(group, control, operation: str, length: int) -> tuple[float, float]
         if rank == 1
         else mx.zeros(shape, dtype=mx.bfloat16)
     )
-    packet = mx.contiguous(packet)
+    # Match the production boundary wire contract exactly. The caller starts
+    # BF16 so this also exercises the explicit normalization step.
+    packet = mx.contiguous(packet.astype(mx.float32))
     mx.eval(packet)
 
     started = time.perf_counter()
@@ -141,7 +143,7 @@ def main() -> int:
         rss_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / GIB
         print(
             f"[rank {rank}] resident JACCL {args.operation}: error={error:.3g} "
-            f"seconds={seconds:.6f} rss={rss_gib:.1f} GiB",
+            f"wire_dtype=FP32 seconds={seconds:.6f} rss={rss_gib:.1f} GiB",
             flush=True,
         )
     finally:
