@@ -914,12 +914,14 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         mx.eval(marker)
 
     def _pipeline_recv(self, template, source):
-        """Receive on the payload mesh, fenced by the control mesh.
+        """Receive on the payload mesh, with a posted completion receive.
 
         A receive can become locally visible before the sender has retired the
-        corresponding RDMA work request.  Barriers therefore use a second
-        JACCL backend instance rather than changing operation type on the
-        payload queue pair while its remote send is still active.
+        corresponding RDMA work request.  Posting the next same-direction
+        receive keeps that queue progressing until the sender can retire the
+        payload and issue its completion marker.  The marker and the control
+        barrier use different queue pairs, so neither changes operation type
+        on an active payload queue.
         """
         self._pipeline_barrier()
         value = mx.distributed.recv_like(
@@ -929,11 +931,19 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(value)
+        completed = mx.distributed.recv_like(
+            mx.zeros((10,), dtype=mx.float32),
+            source,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.async_eval(completed)
         self._pipeline_barrier()
+        mx.eval(completed)
         return value
 
     def _pipeline_send(self, value, destination):
-        """Send on the payload mesh, fenced by the control mesh."""
+        """Send a payload and same-direction completion marker."""
         self._pipeline_barrier()
         sent = mx.distributed.send(
             value,
@@ -942,6 +952,13 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(sent)
+        completed = mx.distributed.send(
+            mx.ones((10,), dtype=mx.float32),
+            destination,
+            group=self.pipeline_group,
+            stream=mx.cpu,
+        )
+        mx.eval(completed)
         self._pipeline_barrier()
         return sent
 
