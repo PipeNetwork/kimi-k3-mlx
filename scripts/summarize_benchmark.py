@@ -50,6 +50,7 @@ def validate_pair(rank0: dict, rank1: dict) -> dict:
         "world_size",
         "backend",
         "transport",
+        "strategy",
         "code",
         "versions",
         "checkpoint",

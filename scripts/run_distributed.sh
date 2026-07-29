@@ -1,5 +1,5 @@
 #!/bin/bash
-# Launch the rank-local Kimi-K3 pipeline. JACCL is mandatory and explicit.
+# Launch a rank-local Kimi-K3 strategy. JACCL is mandatory and explicit.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -8,6 +8,7 @@ HOSTFILE="${KIMI_HOSTFILE:-hosts-jaccl.json}"
 PYTHON="${KIMI_PYTHON:-/Users/agent/dev/kimi-k3-mlx-distributed/.venv/bin/python}"
 REPO_DIR="${KIMI_REPO_DIR:-/Users/agent/dev/kimi-k3-mlx-distributed}"
 RUN_ID="${KIMI_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
+PROGRAM="${KIMI_DISTRIBUTED_PROGRAM:-scripts/distributed_generate.py}"
 
 args=("$@")
 for ((index = 0; index < ${#args[@]}; index++)); do
@@ -49,11 +50,11 @@ release_completed_lock() {
 
 residual_workers() {
     local local_pids remote_pids
-    local_pids="$(pgrep -f '[s]cripts/distributed_generate.py' || true)"
+    local_pids="$(pgrep -f '[s]cripts/(distributed_generate|tensor_generate).py' || true)"
     remote_pids="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_HOST" \
-        "pgrep -f '[s]cripts/distributed_generate.py' || true")"
+        "pgrep -f '[s]cripts/(distributed_generate|tensor_generate).py' || true")"
     if [[ -n "$local_pids" || -n "$remote_pids" ]]; then
-        echo "Refusing to launch while distributed_generate.py is still active." >&2
+        echo "Refusing to launch while a distributed generator is still active." >&2
         [[ -z "$local_pids" ]] || echo "Local worker PIDs: $local_pids" >&2
         [[ -z "$remote_pids" ]] || echo "Remote worker PIDs: $remote_pids" >&2
         return 0
@@ -127,7 +128,7 @@ ssh -o BatchMode=yes "$REMOTE_HOST" \
     --repo "$REPO_DIR" \
     --remote-repo "$REPO_DIR" \
     --python "$PYTHON" \
-    -- /usr/bin/caffeinate -dimsu "$PYTHON" scripts/distributed_generate.py "$@"
+    -- /usr/bin/caffeinate -dimsu "$PYTHON" "$PROGRAM" "$@"
 
 rank0_pid="$($PYTHON -c \
     'import json,sys; print(json.load(open(sys.argv[1]))["ranks"][0]["pid"])' \
