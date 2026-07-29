@@ -31,7 +31,10 @@ def allocate_resident(gib: float, block_mib: int, rank: int) -> list[mx.array]:
     next_report = 32 * GIB
     while allocated < target:
         size = min(block_bytes, target - allocated)
-        block = mx.full((size,), rank + 1, dtype=mx.uint8)
+        # Random bytes are intentionally incompressible. Uniform zero/full
+        # buffers can remain sparse or compress to almost no physical memory,
+        # which does not reproduce a resident model-weight workload.
+        block = mx.random.randint(0, 256, (size,), dtype=mx.uint8)
         mx.eval(block)
         resident.append(block)
         allocated += size
@@ -95,8 +98,14 @@ def main() -> int:
         "--operation", choices=("p2p", "all-sum", "all-gather"), default="p2p"
     )
     parser.add_argument("--length", type=int, default=64)
+    parser.add_argument("--hold-seconds", type=float, default=0)
     args = parser.parse_args()
-    if args.resident_gib < 0 or args.block_mib < 1 or args.length < 1:
+    if (
+        args.resident_gib < 0
+        or args.block_mib < 1
+        or args.length < 1
+        or args.hold_seconds < 0
+    ):
         raise ValueError("resident size, block size, and length must be valid")
 
     group, control = init_distributed_groups("jaccl")
@@ -109,13 +118,24 @@ def main() -> int:
         mx.device_info()["max_recommended_working_set_size"]
     )
     try:
+        mx.random.seed(20260729 + rank)
         resident = allocate_resident(args.resident_gib, args.block_mib, rank)
+        sentinels = (
+            (resident[0][0].item(), resident[-1][-1].item())
+            if resident
+            else None
+        )
+        if args.hold_seconds:
+            print(
+                f"[rank {rank}] holding resident buffers for "
+                f"{args.hold_seconds:g}s",
+                flush=True,
+            )
+            time.sleep(args.hold_seconds)
         error, seconds = transfer(group, control, args.operation, args.length)
         # Keep buffers live through the final collective and integrity check.
         if resident:
-            first = resident[0][0].item()
-            last = resident[-1][-1].item()
-            if first != rank + 1 or last != rank + 1:
+            if sentinels != (resident[0][0].item(), resident[-1][-1].item()):
                 raise AssertionError("resident buffer changed during JACCL transfer")
         # macOS reports ru_maxrss in bytes (Linux reports KiB).
         rss_gib = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / GIB
