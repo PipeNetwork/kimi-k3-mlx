@@ -7,7 +7,11 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.distributed_groups import init_distributed_groups, secondary_coordinator
+from scripts.distributed_groups import (
+    init_distributed_groups,
+    prime_distributed_groups,
+    secondary_coordinator,
+)
 
 
 class FakeGroup:
@@ -55,6 +59,29 @@ class TestDistributedGroups(unittest.TestCase):
         group = FakeGroup()
         with patch("scripts.distributed_groups.mx.distributed.init", return_value=group):
             self.assertEqual(init_distributed_groups("ring"), (group, group))
+
+    def test_prime_runs_once_per_distinct_group(self):
+        payload, control = FakeGroup(), FakeGroup()
+        calls = []
+
+        def all_sum(value, *, group, stream):
+            calls.append(group)
+            return group
+
+        with patch("scripts.distributed_groups.mx.ones", return_value="ready"):
+            with patch("scripts.distributed_groups.mx.distributed.all_sum", all_sum):
+                with patch("scripts.distributed_groups.mx.eval") as evaluate:
+                    prime_distributed_groups(payload, control)
+                    self.assertEqual(evaluate.call_count, 2)
+        self.assertEqual(calls, [payload, control])
+
+        calls.clear()
+        with patch("scripts.distributed_groups.mx.ones", return_value="ready"):
+            with patch("scripts.distributed_groups.mx.distributed.all_sum", all_sum):
+                with patch("scripts.distributed_groups.mx.eval") as evaluate:
+                    prime_distributed_groups(payload, payload)
+                    self.assertEqual(evaluate.call_count, 1)
+        self.assertEqual(calls, [payload])
 
 
 if __name__ == "__main__":

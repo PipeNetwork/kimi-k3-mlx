@@ -4,9 +4,12 @@
 import mlx.core as mx
 
 try:
-    from scripts.distributed_groups import init_distributed_groups
+    from scripts.distributed_groups import (
+        init_distributed_groups,
+        prime_distributed_groups,
+    )
 except ModuleNotFoundError:  # Direct ``python scripts/dual_group_smoke.py``.
-    from distributed_groups import init_distributed_groups
+    from distributed_groups import init_distributed_groups, prime_distributed_groups
 
 
 def main() -> int:
@@ -15,12 +18,7 @@ def main() -> int:
     rank = payload.rank()
     if (payload.size(), control.size(), control.rank()) != (2, 2, rank):
         raise RuntimeError("payload/control group mismatch")
-
-    mx.eval(
-        mx.distributed.all_sum(
-            mx.ones((10,), dtype=mx.float32), group=control, stream=mx.cpu
-        )
-    )
+    prime_distributed_groups(payload, control)
     shape = (5, 1, 64, 7168)
     if rank == 1:
         packet = mx.full(shape, 1.25, dtype=mx.bfloat16)

@@ -906,26 +906,29 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         self.layers = self.layers[: self.end_idx]
         self.layers[: self.start_idx] = [None] * self.start_idx
 
-    def _pipeline_exchange(self, value):
-        """Run and fully evaluate the matched boundary all-gather.
-
-        Both ranks enter with the same shape: rank 1 contributes the computed
-        boundary packet and rank 0 contributes zeros.  Eager evaluation is
-        essential; leaving rank 1's boundary lazy lets the following
-        all-gather overtake it at full-model graph scale.
-        """
-        # JACCL's CPU all-gather copies directly from the input buffer.  A
-        # lazy/non-contiguous packet can otherwise overlap its producing Metal
-        # kernels and crash in JACCL's memmove at full-model scale.
-        value = mx.contiguous(value)
-        mx.eval(value)
-        gathered = mx.distributed.all_gather(
-            value,
+    def _pipeline_recv(self, template, source):
+        """Receive the one-way boundary packet on its dedicated JACCL mesh."""
+        received = mx.distributed.recv_like(
+            template,
+            source,
             group=self.pipeline_group,
             stream=self.pipeline_payload_stream,
         )
-        mx.eval(gathered)
-        return gathered
+        mx.eval(received)
+        return received
+
+    def _pipeline_send(self, value, destination):
+        """Materialize and retire the one-way boundary send before continuing."""
+        value = mx.contiguous(value)
+        mx.eval(value)
+        sent = mx.distributed.send(
+            value,
+            destination,
+            group=self.pipeline_group,
+            stream=self.pipeline_payload_stream,
+        )
+        mx.eval(sent)
+        return value
 
     def _pipeline_masks(self, h, cache):
         ssm_cache = attn_cache = None
@@ -970,9 +973,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             packet_template = mx.zeros(
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
-            gathered = self._pipeline_exchange(packet_template)
-            packet_count = packet_template.shape[0]
-            packet = gathered[packet_count : 2 * packet_count]
+            packet = self._pipeline_recv(packet_template, rank + 1)
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -980,8 +981,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (rawf * rawf).mean(axis=-1) + self.args.rms_norm_eps
             )
         elif rank < size - 1:
-            batch = h.shape[0]
-            h = self._pipeline_exchange(mx.zeros_like(h))[batch : 2 * batch]
+            h = self._pipeline_recv(h, rank + 1)
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -1004,9 +1004,9 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         if rank != 0:
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
-                self._pipeline_exchange(packet)
+                self._pipeline_send(packet, rank - 1)
             else:
-                self._pipeline_exchange(h)
+                self._pipeline_send(h, rank - 1)
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.

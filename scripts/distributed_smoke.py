@@ -8,9 +8,12 @@ import mlx.core as mx
 from mlx_lm.utils import load_model
 
 try:
-    from scripts.distributed_groups import init_distributed_groups
+    from scripts.distributed_groups import (
+        init_distributed_groups,
+        prime_distributed_groups,
+    )
 except ModuleNotFoundError:  # Direct ``python scripts/distributed_smoke.py``.
-    from distributed_groups import init_distributed_groups
+    from distributed_groups import init_distributed_groups, prime_distributed_groups
 
 
 def load_distributed(stage: Path, group, control_group=None):
@@ -39,13 +42,12 @@ def run_boundary_probe(model, group, length: int, hidden_size: int) -> float:
     rank = group.rank()
     # Kimi-K3 rank 1 sends h plus four AttnRes blocks at the 47-layer split.
     shape = (5, 1, length, hidden_size)
-    packet = (
-        mx.full(shape, 1.25, dtype=mx.bfloat16)
-        if rank == 1
-        else mx.zeros(shape, dtype=mx.bfloat16)
-    )
-    gathered = model.model._pipeline_exchange(packet)
-    transferred = gathered[shape[0] :]
+    if rank == 1:
+        packet = mx.full(shape, 1.25, dtype=mx.bfloat16)
+        transferred = model.model._pipeline_send(packet, 0)
+    else:
+        template = mx.zeros(shape, dtype=mx.bfloat16)
+        transferred = model.model._pipeline_recv(template, 1)
     error = mx.max(mx.abs(transferred.astype(mx.float32) - 1.25)).item()
     print(
         f"[rank {rank}] boundary probe: shape={shape}, error={error:.3g}",
@@ -76,6 +78,7 @@ def main() -> int:
     group, control_group = init_distributed_groups(args.backend)
     if group.size() != 2:
         raise RuntimeError(f"expected two ranks, got {group.size()}")
+    prime_distributed_groups(group, control_group)
     rank = group.rank()
     stage = args.root.resolve() / f"rank{rank}"
 

@@ -39,13 +39,16 @@ not downloaded for the text benchmark. The boundary sends one packed BF16
 message containing the current hidden state and accumulated AttnRes blocks;
 the receiver reconstructs inverse-RMS state locally. Boundary transfer and
 final hidden-state synchronization use two independent JACCL backend instances,
-both on the same mandatory RDMA fabric. Each operation is a matched all-gather:
-rank 1 contributes the boundary packet while rank 0 contributes zeros, and the
-second mesh distributes rank 0's completed hidden state. Both collectives are
-fed row-contiguous tensors that are fully materialized before JACCL starts, and
-are evaluated eagerly before either rank can enqueue the next operation. This
-avoids both cross-stream `memmove` races and the lazy collective reordering seen
-at full-model graph scale. The stress test transfers the
+both on the same mandatory RDMA fabric. After one initialization collective on
+each mesh, the payload mesh is point-to-point only: rank 1 fully materializes
+and eagerly sends the boundary packet, while rank 0 receives it and computes
+all 46 local MoE layers before any further communication. Rank 1 cannot enter
+the final synchronization until its send has retired. The second mesh then
+distributes rank 0's completed, row-contiguous hidden state with an eager
+all-gather. Keeping the one-way payload transfer and the final collective on
+different RDMA queue pairs avoids both the sender-retirement deadlock and the
+full-model `memmove` faults observed when the boundary itself was an
+all-gather. The stress test transfers the
 production-shaped 5 x 1 x 64 x 7168 BF16 packet before checking bit-exact
 miniature-model prefill and cached decode parity.
 

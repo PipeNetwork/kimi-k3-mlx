@@ -648,11 +648,13 @@ scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 
 `scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
 mode and requires exactly two ranks. Boundary and final-state transfers use
-eager, matched all-gathers on two independent JACCL backend instances over the
-same RDMA fabric. Inputs are made row-contiguous and fully materialized before
-JACCL's CPU copy begins; eager evaluation then prevents full-model lazy graphs
-from reordering different collective shapes. A missing RDMA/JACCL fabric is an
-error, not a performance-degrading fallback.
+two independent JACCL backend instances over the same RDMA fabric. After an
+initialization collective on each mesh, rank 1 sends the fully materialized
+boundary packet eagerly over the point-to-point-only payload mesh. Rank 0 then
+computes its complete stage before the final eager all-gather runs on the
+separate control mesh. This prevents a collective from overtaking an
+unretired send and avoids the full-model boundary-all-gather copy fault. A
+missing RDMA/JACCL fabric is an error, not a performance-degrading fallback.
 
 ## Status
 

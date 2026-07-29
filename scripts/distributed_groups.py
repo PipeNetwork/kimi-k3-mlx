@@ -43,3 +43,20 @@ def init_distributed_groups(backend: str):
     if (control.rank(), control.size()) != (payload.rank(), payload.size()):
         raise RuntimeError("payload and control JACCL groups do not match")
     return payload, control
+
+
+def prime_distributed_groups(payload, control) -> None:
+    """Complete one CPU collective on each mesh before point-to-point use.
+
+    JACCL requires every rank to finish backend initialization before the first
+    point-to-point operation.  After this function returns, production never
+    runs another collective on ``payload``; all later collectives use the
+    independent ``control`` mesh.
+    """
+    groups = (payload,) if control is payload else (payload, control)
+    for group in groups:
+        mx.eval(
+            mx.distributed.all_sum(
+                mx.ones((10,), dtype=mx.float32), group=group, stream=mx.cpu
+            )
+        )

@@ -21,9 +21,12 @@ from mlx_lm.utils import load_model, load_tokenizer
 from mlx.utils import tree_flatten
 
 try:
-    from scripts.distributed_groups import init_distributed_groups
+    from scripts.distributed_groups import (
+        init_distributed_groups,
+        prime_distributed_groups,
+    )
 except ModuleNotFoundError:  # Direct ``python scripts/distributed_generate.py``.
-    from distributed_groups import init_distributed_groups
+    from distributed_groups import init_distributed_groups, prime_distributed_groups
 
 
 def parse_active_rdma_ports(output: str) -> list[str]:
@@ -252,6 +255,7 @@ def main() -> int:
     rank, size = group.rank(), group.size()
     if size != 2:
         raise RuntimeError(f"this deployment requires exactly two JACCL ranks, got {size}")
+    prime_distributed_groups(group, control_group)
     rdma = rdma_state()
 
     model_root = args.model_root.resolve()
