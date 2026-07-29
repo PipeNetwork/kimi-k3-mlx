@@ -1,0 +1,22 @@
+{
+  "backend": "jaccl",
+  "generation_tps": {
+    "max": 3.7493107532193735,
+    "median": 3.7493107532193735,
+    "min": 3.7493107532193735
+  },
+  "peak_memory_gb": 414.121718225,
+  "prompt_tps": {
+    "max": 10.418586513823724,
+    "median": 10.418586513823724,
+    "min": 10.418586513823724
+  },
+  "rank": 1,
+  "records": [
+    "4f8564c-tp-full-smoke-20260729T210927Z"
+  ],
+  "run_id": "4f8564c-tp-full-smoke-20260729T210927Z",
+  "schema": 1,
+  "strategy": "tensor-parallel",
+  "transport": "thunderbolt-rdma"
+}

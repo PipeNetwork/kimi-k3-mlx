@@ -19,6 +19,25 @@ checkpoint revision, host topology, command, and machine-readable record.
 - Default JACCL mesh collectives. Set `MLX_JACCL_RING=1` only for an explicitly
   labeled comparison; the runner records and validates the selected mode.
 
+## Canonical reference result
+
+Commit `4f8564c`, suite run
+`4f8564c-tp-canonical-20260729T211125Z`, completed all nine paired records:
+
+| Metric | Result |
+|---|---:|
+| Decode median | 3.632 tok/s |
+| Decode range | 3.436–3.649 tok/s |
+| Prefill median | 47.911 tok/s |
+| Peak memory | 414.302 GB |
+| Rank agreement | 9/9 exact generated texts |
+
+The [raw rank records and validated summary](../benchmarks/results/4f8564c-tp-canonical-20260729T211125Z)
+are committed. A matched 256-token factual comparison measured JACCL ring at
+3.64854 tok/s and default mesh at 3.64891 tok/s; ring provided no speedup, so
+mesh remains the primary topology. The earlier serial pipeline proof decoded
+at 0.0891 tok/s and remains a correctness baseline only.
+
 ## Required procedure
 
 1. Reboot or record significant concurrent workloads; stop unrelated model

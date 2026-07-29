@@ -30,8 +30,8 @@ and routed-expert matrix across two ranks. Both hosts execute all 93 layers:
 
 | Host | Rank | Decoder layers | TP fraction | Local checkpoint |
 |---|---:|---:|---:|---:|
-| Beast1 | 0 | `[0, 93)` | rank-local half | ~383.34 GiB |
-| Beast2 | 1 | `[0, 93)` | rank-local half | ~383.34 GiB |
+| Beast1 | 0 | `[0, 93)` | rank-local half | 383.335683 GiB |
+| Beast2 | 1 | `[0, 93)` | rank-local half | 383.335683 GiB |
 
 Vision weights are excluded from this text benchmark. The converter consumes
 the already SHA-256-verified pipeline downloads in opposite ranges. For each

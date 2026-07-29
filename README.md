@@ -21,6 +21,12 @@ in [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md). Benchmark submissions must follow
 [docs/BENCHMARKING.md](docs/BENCHMARKING.md), and contributions follow
 [CONTRIBUTING.md](CONTRIBUTING.md).
 
+The canonical two-host proof at commit `4f8564c` completed all nine paired
+JACCL/RDMA records with identical rank outputs: median decode **3.632 tok/s**
+(range 3.436–3.649), median prefill **47.911 tok/s**, and **414.302 GB** peak
+memory. The complete machine-readable records are in
+[`benchmarks/results/4f8564c-tp-canonical-20260729T211125Z`](benchmarks/results/4f8564c-tp-canonical-20260729T211125Z).
+
 MLX (Apple Silicon) port of [**moonshotai/Kimi-K3**](https://huggingface.co/moonshotai/Kimi-K3) —
 Moonshot's 2.78T-total / 104B-active native-multimodal MoE, built on Kimi Delta
 Attention (KDA) and Attention Residuals (AttnRes), with a 1M-token context.
@@ -270,7 +276,7 @@ is 883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is wha
 [REAP pruning](#reap-expert-pruning) exists to solve for one Mac. This fork's
 second route is a two-machine JACCL tensor-parallel deployment. Each host keeps
 one half of every sharded matrix, so the 816.77 GB UVMAX checkpoint becomes
-about 383.34 GiB per rank. A serial 47/46-layer pipeline remains as a
+383.335683 GiB per rank. A serial 47/46-layer pipeline remains as a
 correctness/debugging baseline, not the performance deployment.
 
 Consequences, stated plainly:
@@ -294,7 +300,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers both loaders, runs all 83 tests
+scripts/test_all.sh                     # registers both loaders, runs all 101 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -663,7 +669,7 @@ point-to-point pipeline for diagnosis and regression testing.
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 87 tests discovered: 80 passing, 7 hardware/reference-data skips
+- [x] 101 tests discovered: 94 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
@@ -676,7 +682,7 @@ point-to-point pipeline for diagnosis and regression testing.
 - [x] exact two-rank prefill and cached-decode parity on a miniature K3
 - [x] exact 64-token/32-step tensor parity over real two-host JACCL/RDMA
 - [x] production runner hard-requires JACCL and two ranks
-- [ ] full tensor-parallel two-M3-Ultra JACCL generation and canonical benchmark
+- [x] full tensor-parallel two-M3-Ultra JACCL generation and canonical benchmark
 - [ ] AWQ re-run on a balanced calibration corpus (in progress)
 - [ ] tok/s re-measured for all published tiers after the wiring fix
 

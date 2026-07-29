@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -12,6 +13,9 @@ import mlx.core as mx
 from mlx.utils import tree_flatten
 from mlx_lm.models import kimi_k3_uvmax
 from mlx_lm.utils import save_model
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from scripts.make_tiny_uvmax_fixture import config
 from scripts.shard_uvmax_file import OfflineGroup, sha256_file, shard_file

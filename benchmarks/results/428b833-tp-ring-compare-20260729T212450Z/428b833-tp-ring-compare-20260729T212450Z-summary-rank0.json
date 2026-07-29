@@ -1,0 +1,22 @@
+{
+  "backend": "jaccl",
+  "generation_tps": {
+    "max": 3.648544731342199,
+    "median": 3.648544731342199,
+    "min": 3.648544731342199
+  },
+  "peak_memory_gb": 414.146503308,
+  "prompt_tps": {
+    "max": 45.586980814152625,
+    "median": 45.586980814152625,
+    "min": 45.586980814152625
+  },
+  "rank": 0,
+  "records": [
+    "428b833-tp-ring-compare-20260729T212450Z"
+  ],
+  "run_id": "428b833-tp-ring-compare-20260729T212450Z",
+  "schema": 1,
+  "strategy": "tensor-parallel",
+  "transport": "thunderbolt-rdma"
+}
