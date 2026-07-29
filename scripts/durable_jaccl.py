@@ -267,6 +267,8 @@ def wait_for_local_coordinator(
 def launch(args: argparse.Namespace) -> int:
     if not SAFE_RUN_ID.fullmatch(args.run_id):
         raise ValueError(f"unsafe run id: {args.run_id!r}")
+    if not 1 <= args.port < 65535:
+        raise ValueError("--port must leave room for the control coordinator")
     hostfile, devices = load_jaccl_hostfile(args.hostfile.resolve())
     repo = args.repo.resolve()
     python = args.python.resolve()
@@ -295,9 +297,11 @@ def launch(args: argparse.Namespace) -> int:
     )
 
     coordinator = f"{hostfile['hosts'][0]['ips'][0]}:{args.port}"
+    control_coordinator = f"{hostfile['hosts'][0]['ips'][0]}:{args.port + 1}"
     hostfile_sha256 = hashlib.sha256(args.hostfile.read_bytes()).hexdigest()
     common = {
         "KIMI_HOSTFILE_SHA256": hostfile_sha256,
+        "KIMI_JACCL_CONTROL_COORDINATOR": control_coordinator,
         "KIMI_RUN_ID": args.run_id,
         "MLX_JACCL_COORDINATOR": coordinator,
         "MLX_METAL_FAST_SYNCH": "1",
@@ -367,6 +371,7 @@ def launch(args: argparse.Namespace) -> int:
         "backend": "jaccl",
         "transport": "thunderbolt-rdma",
         "coordinator": coordinator,
+        "control_coordinator": control_coordinator,
         "hostfile": str(args.hostfile.resolve()),
         "hostfile_sha256": hostfile_sha256,
         "devices": devices,

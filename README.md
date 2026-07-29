@@ -647,8 +647,10 @@ scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 ```
 
 `scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
-mode and requires exactly two ranks. A missing RDMA/JACCL fabric is an error,
-not a performance-degrading fallback.
+mode and requires exactly two ranks. Payloads and control collectives use two
+independent JACCL backend instances on the same RDMA fabric so a still-retiring
+point-to-point send can never share a queue pair with the next collective. A
+missing RDMA/JACCL fabric is an error, not a performance-degrading fallback.
 
 ## Status
 

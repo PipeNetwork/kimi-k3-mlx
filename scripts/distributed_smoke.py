@@ -7,10 +7,15 @@ from pathlib import Path
 import mlx.core as mx
 from mlx_lm.utils import load_model
 
+try:
+    from scripts.distributed_groups import init_distributed_groups
+except ModuleNotFoundError:  # Direct ``python scripts/distributed_smoke.py``.
+    from distributed_groups import init_distributed_groups
 
-def load_distributed(stage: Path, group):
+
+def load_distributed(stage: Path, group, control_group=None):
     model, _ = load_model(stage, lazy=True, strict=True)
-    model.model.pipeline(group)
+    model.model.pipeline(group, control_group or group)
     mx.eval(model.parameters())
     return model
 
@@ -67,13 +72,13 @@ def main() -> int:
     args = parser.parse_args()
     if args.prefill_length < 1 or args.decode_steps < 1:
         raise ValueError("prefill length and decode steps must be positive")
-    group = mx.distributed.init(strict=True, backend=args.backend)
+    group, control_group = init_distributed_groups(args.backend)
     if group.size() != 2:
         raise RuntimeError(f"expected two ranks, got {group.size()}")
     rank = group.rank()
     stage = args.root.resolve() / f"rank{rank}"
 
-    distributed = load_distributed(stage, group)
+    distributed = load_distributed(stage, group, control_group)
     if args.production_boundary_probe:
         boundary_error = run_boundary_probe(distributed, group, args.prefill_length, 7168)
         if boundary_error != 0:

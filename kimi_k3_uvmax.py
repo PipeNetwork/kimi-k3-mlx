@@ -882,7 +882,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 self.attn_idx = i
                 break
 
-    def pipeline(self, group):
+    def pipeline(self, group, control_group=None):
         """Split all 93 layers without the generic odd-layer gap.
 
         MLX pipelines run from the highest rank toward rank zero.  With two
@@ -892,6 +892,12 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         self.pipeline_rank = group.rank()
         self.pipeline_size = group.size()
         self.pipeline_group = group
+        self.pipeline_control_group = control_group or group
+        if (
+            self.pipeline_control_group.rank() != self.pipeline_rank
+            or self.pipeline_control_group.size() != self.pipeline_size
+        ):
+            raise ValueError("pipeline payload and control groups do not match")
         self.start_idx, self.end_idx = pipeline_bounds(
             len(self.layers), self.pipeline_size, self.pipeline_rank
         )
@@ -899,25 +905,21 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         self.layers[: self.start_idx] = [None] * self.start_idx
 
     def _pipeline_barrier(self):
-        """Drain JACCL before changing operation type on its RDMA queue pair."""
+        """Synchronize on the independent JACCL control queue pair."""
         marker = mx.distributed.all_sum(
             mx.ones((10,), dtype=mx.float32),
-            group=self.pipeline_group,
+            group=self.pipeline_control_group,
             stream=mx.cpu,
         )
         mx.eval(marker)
 
     def _pipeline_recv(self, template, source):
-        """Receive a pipeline packet and its same-direction completion marker.
+        """Receive on the payload mesh, fenced by the control mesh.
 
         A receive can become locally visible before the sender has retired the
-        corresponding RDMA work request.  Entering a collective in that window
-        deadlocks JACCL for packets larger than its eager path.  A reverse-
-        direction acknowledgement also deadlocks because both peers enter
-        send.  Instead, the receiver posts a second receive while the sender
-        finishes the payload and then sends a small marker in the same
-        direction.  The marker cannot be issued until the payload send has
-        retired, so it is a completion fence without changing queue direction.
+        corresponding RDMA work request.  Barriers therefore use a second
+        JACCL backend instance rather than changing operation type on the
+        payload queue pair while its remote send is still active.
         """
         self._pipeline_barrier()
         value = mx.distributed.recv_like(
@@ -927,18 +929,11 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(value)
-        completed = mx.distributed.recv_like(
-            mx.zeros((10,), dtype=mx.float32),
-            source,
-            group=self.pipeline_group,
-            stream=mx.cpu,
-        )
-        mx.eval(completed)
         self._pipeline_barrier()
         return value
 
     def _pipeline_send(self, value, destination):
-        """Send a pipeline packet followed by a same-direction completion marker."""
+        """Send on the payload mesh, fenced by the control mesh."""
         self._pipeline_barrier()
         sent = mx.distributed.send(
             value,
@@ -947,13 +942,6 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(sent)
-        completed = mx.distributed.send(
-            mx.ones((10,), dtype=mx.float32),
-            destination,
-            group=self.pipeline_group,
-            stream=mx.cpu,
-        )
-        mx.eval(completed)
         self._pipeline_barrier()
         return sent
 
@@ -1041,7 +1029,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         if size > 1:
             h = mx.distributed.all_gather(
                 h,
-                group=self.pipeline_group,
+                group=self.pipeline_control_group,
                 stream=mx.cpu,
             )[: h.shape[0]]
         return self.norm(h)

@@ -20,6 +20,11 @@ from mlx_lm.sample_utils import make_sampler
 from mlx_lm.utils import load_model, load_tokenizer
 from mlx.utils import tree_flatten
 
+try:
+    from scripts.distributed_groups import init_distributed_groups
+except ModuleNotFoundError:  # Direct ``python scripts/distributed_generate.py``.
+    from distributed_groups import init_distributed_groups
+
 
 def parse_active_rdma_ports(output: str) -> list[str]:
     """Extract active HCA names from macOS ``ibv_devinfo`` output."""
@@ -109,7 +114,7 @@ def load_manifest(stage: Path, rank: int, size: int) -> dict:
     return manifest
 
 
-def load_pipeline(stage: Path, group):
+def load_pipeline(stage: Path, group, control_group=None):
     """Load only files present in a rank-local stage, then prune lazy layers.
 
     This is the local-checkpoint half of ``mlx_lm.utils.sharded_load`` without
@@ -119,7 +124,8 @@ def load_pipeline(stage: Path, group):
     model, config = load_model(stage, lazy=True, strict=False)
     if not hasattr(model, "model") or not hasattr(model.model, "pipeline"):
         raise TypeError("the selected loader does not support pipeline inference")
-    model.model.pipeline(group)
+    control_group = control_group or group
+    model.model.pipeline(group, control_group)
     weight_map = json.loads(
         (stage / "model.safetensors.index.json").read_text()
     )["weight_map"]
@@ -134,7 +140,13 @@ def load_pipeline(stage: Path, group):
             f"rank-local checkpoint does not cover {len(missing)} parameters: {preview}"
         )
     mx.eval(model.parameters())
-    mx.eval(mx.distributed.all_sum(mx.array(1.0), group=group, stream=mx.cpu))
+    mx.eval(
+        mx.distributed.all_sum(
+            mx.ones((10,), dtype=mx.float32),
+            group=control_group,
+            stream=mx.cpu,
+        )
+    )
     tokenizer = load_tokenizer(
         stage,
         {"trust_remote_code": True},
@@ -236,7 +248,7 @@ def main() -> int:
     cases = benchmark_cases(args)
 
     # Mandatory by design: this refuses to silently fall back to TCP ring/MPI.
-    group = mx.distributed.init(strict=True, backend="jaccl")
+    group, control_group = init_distributed_groups("jaccl")
     rank, size = group.rank(), group.size()
     if size != 2:
         raise RuntimeError(f"this deployment requires exactly two JACCL ranks, got {size}")
@@ -259,7 +271,7 @@ def main() -> int:
     )
 
     load_started = time.perf_counter()
-    model, tokenizer = load_pipeline(stage, group)
+    model, tokenizer = load_pipeline(stage, group, control_group)
     load_seconds = time.perf_counter() - load_started
     print(f"[rank {rank}] model loaded in {load_seconds:.3f}s", flush=True)
 
@@ -304,6 +316,13 @@ def main() -> int:
                 "world_size": size,
                 "backend": "jaccl",
                 "transport": "thunderbolt-rdma",
+                "communication": {
+                    "payload_group": "jaccl-rdma",
+                    "control_group": "jaccl-rdma",
+                    "control_coordinator": os.environ.get(
+                        "KIMI_JACCL_CONTROL_COORDINATOR"
+                    ),
+                },
                 "rdma": rdma,
                 "jaccl_hostfile_sha256": os.environ.get("KIMI_HOSTFILE_SHA256"),
                 "mlx_metal_fast_synch": os.environ.get("MLX_METAL_FAST_SYNCH"),
