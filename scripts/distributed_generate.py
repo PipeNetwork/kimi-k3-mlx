@@ -93,6 +93,11 @@ def load_manifest(stage: Path, rank: int, size: int) -> dict:
     pipeline = manifest.get("pipeline", {})
     if not manifest.get("complete"):
         raise RuntimeError(f"stage is incomplete: {path}")
+    if manifest.get("weights", {}).get("sha256_verified") is not True:
+        raise RuntimeError(
+            f"stage has no full SHA-256 verification proof: {path}; "
+            "rerun prepare_uvmax_stage.py with --verify-sha256"
+        )
     if pipeline.get("rank") != rank or pipeline.get("world_size") != size:
         raise RuntimeError(
             f"stage rank mismatch: manifest={pipeline}, runtime rank={rank}/{size}"

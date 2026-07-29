@@ -307,7 +307,7 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | `test_vision_parity.py` | vision tower vs torch reference | 9 |
 | `test_processor_integration.py` | real processor -> MLX tower | 7 |
 | `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
-| `test_uvmax.py` | loader, stage selection, benchmark suite, pipeline split | 4 |
+| `test_uvmax.py` | loader, stage integrity, benchmark/RDMA proof, pipeline split | 8 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -637,9 +637,9 @@ uv sync --frozen
 scripts/install_model.sh .venv/bin/python
 
 # Beast1 is rank 0; run rank 1 on Beast2 in parallel.
-.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0
+.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0 --verify-sha256
 ssh beast2.local 'cd ~/dev/kimi-k3-mlx-distributed && \
-  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1'
+  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1 --verify-sha256'
 
 # After connecting Thunderbolt 5 and confirming RDMA is active:
 scripts/configure_jaccl.sh
@@ -656,7 +656,7 @@ not a performance-degrading fallback.
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 83 tests discovered: 76 passing, 7 hardware/reference-data skips
+- [x] 87 tests discovered: 80 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,

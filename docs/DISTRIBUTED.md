@@ -68,16 +68,17 @@ resumable, and use Hugging Face Xet high-performance mode on internal NVMe.
 
 ```bash
 # Beast1
-.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0
+.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0 --verify-sha256
 
 # Beast2
 ssh beast2.local 'cd ~/dev/kimi-k3-mlx-distributed && \
-  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1'
+  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1 --verify-sha256'
 ```
 
-Each `stage-manifest.json` records the source commit, SHA-256 supplied by the
-Hub, exact sizes, rank, and layer interval. The production runner rejects an
-incomplete or truncated stage.
+Each `stage-manifest.json` records the source commit, exact sizes, rank, layer
+interval, and proof that every completed shard matched the SHA-256 supplied by
+the Hub. The production runner rejects an incomplete, truncated, or unverified
+stage.
 
 ## Thunderbolt RDMA and JACCL
 

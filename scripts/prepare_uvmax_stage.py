@@ -10,6 +10,7 @@ files, validates disk headroom, resumes safely, and records exact provenance.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -139,6 +140,14 @@ def download_metadata(
     shutil.copy2(source, destination)
 
 
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        while chunk := source.read(8 * 2**20):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rank", type=int, required=True)
@@ -155,6 +164,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--metadata-only", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
+    parser.add_argument(
+        "--verify-sha256",
+        action="store_true",
+        help="Read every selected shard and verify its Hub SHA-256 before completion.",
+    )
     return parser.parse_args()
 
 
@@ -256,6 +270,7 @@ def main() -> int:
         "weights": {
             "bytes": required_bytes,
             "gib": required_bytes / 2**30,
+            "sha256_verified": False,
             "files": [
                 {
                     "name": name,
@@ -316,6 +331,25 @@ def main() -> int:
     ]
     if invalid:
         raise IOError(f"stage validation failed for {invalid}")
+    if args.verify_sha256:
+        missing_hash = [name for name in selected if not metadata[name]["sha256"]]
+        if missing_hash:
+            raise RuntimeError(f"Hub metadata has no SHA-256 for {missing_hash}")
+        print(f"[verify] hashing {len(selected)} weight shards", flush=True)
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {
+                pool.submit(sha256_file, output / name): name for name in selected
+            }
+            for number, future in enumerate(as_completed(futures), 1):
+                name = futures[future]
+                actual = future.result()
+                expected = metadata[name]["sha256"]
+                if actual != expected:
+                    raise IOError(
+                        f"{name}: expected SHA-256 {expected}, got {actual}"
+                    )
+                print(f"[verify {number}/{len(selected)}] {name}", flush=True)
+        manifest["weights"]["sha256_verified"] = True
     manifest["complete"] = True
     atomic_json(output / "stage-manifest.json", manifest)
     print(

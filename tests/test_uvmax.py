@@ -11,8 +11,12 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mlx_lm.models import kimi_k3_uvmax
-from scripts.distributed_generate import benchmark_cases, parse_active_rdma_ports
-from scripts.prepare_uvmax_stage import pipeline_bounds, select_stage_files
+from scripts.distributed_generate import (
+    benchmark_cases,
+    load_manifest,
+    parse_active_rdma_ports,
+)
+from scripts.prepare_uvmax_stage import pipeline_bounds, select_stage_files, sha256_file
 from scripts.summarize_benchmark import validate_pair
 
 
@@ -73,6 +77,30 @@ class FakeGroup:
 
 
 class TestUvmaxStage(unittest.TestCase):
+    def test_runner_requires_sha256_verified_stage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp)
+            manifest = {
+                "complete": True,
+                "pipeline": {"rank": 0, "world_size": 2},
+                "weights": {"files": [], "sha256_verified": False},
+            }
+            (stage / "stage-manifest.json").write_text(json.dumps(manifest))
+            with self.assertRaisesRegex(RuntimeError, "SHA-256"):
+                load_manifest(stage, 0, 2)
+            manifest["weights"]["sha256_verified"] = True
+            (stage / "stage-manifest.json").write_text(json.dumps(manifest))
+            self.assertEqual(load_manifest(stage, 0, 2), manifest)
+
+    def test_stage_sha256(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "weight.safetensors"
+            path.write_bytes(b"abc")
+            self.assertEqual(
+                sha256_file(path),
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+            )
+
     def test_paired_benchmark_validation(self):
         base = {
             "run_id": "test-factual-r1",
