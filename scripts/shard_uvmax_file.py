@@ -63,6 +63,7 @@ def shard_file(
     output: Path,
     rank: int,
     world_size: int,
+    trusted_source_sha256: str | None = None,
 ) -> dict:
     source_root = source_root.resolve()
     source_file = source_file.resolve()
@@ -118,7 +119,7 @@ def shard_file(
         "world_size": world_size,
         "source": source_file.name,
         "source_bytes": source_file.stat().st_size,
-        "source_sha256": sha256_file(source_file),
+        "source_sha256": trusted_source_sha256 or sha256_file(source_file),
         "output": output.name,
         "output_bytes": output.stat().st_size,
         "output_sha256": sha256_file(output),
@@ -136,6 +137,10 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--rank", type=int, required=True)
     parser.add_argument("--world-size", type=int, default=2)
+    parser.add_argument(
+        "--trusted-source-sha256",
+        help="Pinned digest already verified by the calling conversion journal.",
+    )
     args = parser.parse_args()
     if args.world_size < 1 or not 0 <= args.rank < args.world_size:
         raise ValueError("invalid TP rank/world size")
@@ -145,6 +150,7 @@ def main() -> int:
         args.output,
         args.rank,
         args.world_size,
+        args.trusted_source_sha256,
     )
     return 0
 
