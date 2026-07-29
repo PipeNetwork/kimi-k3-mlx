@@ -7,7 +7,7 @@
 #
 # Usage: scripts/run_calibration.sh [DOWNLOAD_PID]
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 PY="${PY:-python3}"
 SRC="${SRC:-$PWD/Kimi-K3-src}"
 DL_PID="${1:-}"
