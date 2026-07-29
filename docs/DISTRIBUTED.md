@@ -19,43 +19,34 @@ Routed expert FFNs—93.8% of parameters—are affine 2-bit/group-128. Attention
 Tarjei Mandt's
 [`mlx-lm` PR #1626](https://github.com/ml-explore/mlx-lm/pull/1626) demonstrates
 this exact checkpoint over JACCL on two M3 Ultras. This fork pins that loader as
-the proven compatibility base, adds stable-release compatibility, and uses a
-pipeline-local disk layout because neither internal 1 TB SSD can hold a full
-checkpoint plus safe working space.
+the proven compatibility base, adds stable-release compatibility, and builds
+rank-local tensor checkpoints without ever placing the 760.68 GiB source on
+one internal SSD.
 
 ## Partition and storage
 
-MLX pipelines execute from the highest rank toward rank zero. Kimi-K3 has 93
-decoder layers, of which only layer 0 is dense. The gap-free split is:
+The production layout shards every supported attention, dense, shared-expert,
+and routed-expert matrix across two ranks. Both hosts execute all 93 layers:
 
-| Host | Rank | Decoder layers | MoE layers | Local weight files |
+| Host | Rank | Decoder layers | TP fraction | Local checkpoint |
 |---|---:|---:|---:|---:|
-| Beast1 | 0 | `[47, 93)` | 46 | 384.301 GiB |
-| Beast2 | 1 | `[0, 47)` | 46 plus dense layer 0 | 384.462 GiB |
+| Beast1 | 0 | `[0, 93)` | rank-local half | ~383.34 GiB |
+| Beast2 | 1 | `[0, 93)` | rank-local half | ~383.34 GiB |
 
-The embedding, final norm/AttnRes, and LM head endpoint shards are duplicated
-because released mlx-lm generation samples on every rank. Vision weights are
-not downloaded for the text benchmark. The boundary sends one packed BF16
-message containing the current hidden state and accumulated AttnRes blocks;
-the receiver reconstructs inverse-RMS state locally. Boundary transfer and
-final hidden-state synchronization use two independent JACCL backend instances,
-both on the same mandatory RDMA fabric. After one initialization collective on
-each mesh, the payload mesh is point-to-point only: rank 1 fully materializes
-and eagerly sends the boundary packet in an explicit FP32 wire format, while
-rank 0 allocates an identically shaped FP32 receive and computes all 46 local
-MoE layers before any further communication. This explicit dtype is required:
-rank 0's local embedding is BF16, but rank 1's actual post-MoE activation is
-FP32, and JACCL point-to-point calls match raw byte counts rather than tensor
-metadata. Inferring the receive dtype from the embedding consumed only half
-the payload and left the sender polling forever. Rank 1 cannot enter the final
-synchronization until its correctly matched send has retired. The second mesh
-then distributes rank 0's completed, row-contiguous hidden state with an eager
-all-gather. Keeping the matched one-way payload transfer and final collective
-on different RDMA queue pairs avoids the prior sender-retirement deadlock and
-the same byte-count mismatch that caused full-model boundary-all-gather
-`memmove` faults. The stress test starts with a production-shaped
-5 x 1 x 64 x 7168 BF16 caller tensor, proves its normalized FP32 wire transfer,
-then checks bit-exact miniature-model prefill and cached decode parity.
+Vision weights are excluded from this text benchmark. The converter consumes
+the already SHA-256-verified pipeline downloads in opposite ranges. For each
+source file it verifies the pinned digest, creates both deterministic TP
+slices, hashes them, transfers the peer slice over the direct Thunderbolt
+address, verifies it again, installs both atomically, and only then releases
+that exact source file. A fsynced journal makes the operation resumable. The
+source remains recoverable from the immutable Hub revision.
+
+The older pipeline layout is retained as a diagnostic baseline: rank 1 owns
+layers `[0,47)` and rank 0 owns `[47,93)`. Its production boundary uses the
+proven CPU barrier → eager FP32 point-to-point RDMA transfer → CPU barrier
+sequence; JACCL matches bytes rather than tensor metadata, so the explicit
+FP32 wire dtype is mandatory. That layout proves full-model correctness but
+serializes the two machines and is not used for performance claims.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source
@@ -78,7 +69,7 @@ barrier, race, and multi-wire receive fixes. Kimi-K3 support is carried locally
 from the pinned upstream contribution until it lands in a stable mlx-lm
 release; this is recorded in `kimi_k3_uvmax.py` and `NOTICE.md`.
 
-## Stage download
+## Stage download and TP conversion
 
 Run both downloads concurrently. They are revision-pinned, size-validated,
 resumable, and use Hugging Face Xet high-performance mode on internal NVMe.
@@ -96,6 +87,17 @@ Each `stage-manifest.json` records the source commit, exact sizes, rank, layer
 interval, and proof that every completed shard matched the SHA-256 supplied by
 the Hub. The production runner rejects an incomplete, truncated, or unverified
 stage.
+
+Convert both downloads into complete rank-local TP checkpoints:
+
+```bash
+KIMI_REMOTE_HOST=beast2.local scripts/run_tensor_conversion.sh
+```
+
+The launcher balances both producers, uses the direct `192.168.0.1/2`
+Thunderbolt addresses for peer slices, validates all 185 files and every tensor
+shape, writes an exact index, then seals each stage with per-file SHA-256
+records. It is safe to rerun after interruption.
 
 ## Thunderbolt RDMA and JACCL
 
@@ -117,23 +119,23 @@ stage.
 5. Run inference:
 
    ```bash
-   scripts/run_distributed.sh \
+   scripts/run_tensor.sh \
      --prompt 'Who is Albert Einstein?' \
      --max-tokens 256
    ```
 
-`scripts/distributed_generate.py` explicitly calls
+`scripts/tensor_generate.py` explicitly calls
 `mx.distributed.init(strict=True, backend="jaccl")` and requires group size 2.
-No code path silently selects ring, MPI, Ethernet, or a single process.
+Every tensor-parallel model collective uses that group. No code path silently
+selects ring, MPI, Ethernet, or a single process.
 
 ## Validation order
 
 Before reporting a result:
 
 1. `scripts/test_all.sh` passes in the frozen environment.
-2. The two-rank worker passes the production-sized boundary transfer plus
-   64-token prefill and 32 cached decode steps, first locally and then on real
-   JACCL/RDMA.
+2. The two-rank tensor worker passes 64-token prefill and 32 cached decode steps,
+   first locally and then on real JACCL/RDMA.
 3. Both stage manifests are complete and all byte sizes validate.
 4. RDMA reports active on both machines and JACCL initialization succeeds.
 5. A deterministic 32-token smoke prompt produces coherent output.

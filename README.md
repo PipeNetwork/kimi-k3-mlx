@@ -11,7 +11,8 @@ The preferred checkpoint is
 [kernelpool/Kimi-K3-2bit-UVMAX](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX),
 a 816.77 GB mixed-precision MLX build whose 2.72T routed-expert parameters are
 2-bit. It keeps the quality-sensitive attention, shared experts, routers, and
-embeddings at 4–8 bits while fitting as two balanced local stages. The original
+embeddings at 4–8 bits while fitting as two rank-local tensor-parallel
+checkpoints. The original
 883 GB uniform 2-bit streaming conversion remains supported as the fully
 reproducible build path.
 
@@ -267,9 +268,10 @@ Two things the numbers say that the earlier text got backwards:
 memory tops out at 512 GB (M3 Ultra Mac Studio); the original smallest full tier
 is 883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
 [REAP pruning](#reap-expert-pruning) exists to solve for one Mac. This fork's
-second route is a two-machine pipeline: the 816.77 GB UVMAX checkpoint becomes
-384.301 GiB on rank 0 and 384.462 GiB on rank 1, including duplicated embedding
-and output tensors required by released mlx-lm generation.
+second route is a two-machine JACCL tensor-parallel deployment. Each host keeps
+one half of every sharded matrix, so the 816.77 GB UVMAX checkpoint becomes
+about 383.34 GiB per rank. A serial 47/46-layer pipeline remains as a
+correctness/debugging baseline, not the performance deployment.
 
 Consequences, stated plainly:
 
@@ -308,6 +310,7 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | `test_processor_integration.py` | real processor -> MLX tower | 7 |
 | `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
 | `test_uvmax.py` | loader, stage integrity, benchmark/RDMA proof, pipeline split | 8 |
+| `test_tensor_stage.py` | offline TP conversion, index, strict rank-local load | 1 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -636,28 +639,23 @@ checkpoint builder instead:
 uv sync --frozen
 scripts/install_model.sh .venv/bin/python
 
-# Beast1 is rank 0; run rank 1 on Beast2 in parallel.
+# Beast1 is rank 0; download rank 1 on Beast2 in parallel.
 .venv/bin/python scripts/prepare_uvmax_stage.py --rank 0 --verify-sha256
 ssh beast2.local 'cd ~/dev/kimi-k3-mlx-distributed && \
   .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1 --verify-sha256'
 
 # After connecting Thunderbolt 5 and confirming RDMA is active:
 scripts/configure_jaccl.sh
-scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
+scripts/run_tensor_conversion.sh
+scripts/run_tensor.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 ```
 
-`scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
-mode and requires exactly two ranks. Boundary and final-state transfers use
-two independent JACCL backend instances over the same RDMA fabric. After an
-initialization collective on each mesh, rank 1 sends the fully materialized
-FP32 boundary packet eagerly over the point-to-point-only payload mesh. The
-wire dtype is explicit because rank 0's embedding is BF16 while rank 1's
-post-MoE activation is FP32; JACCL matches raw byte counts. Rank 0 then computes
-its complete stage before the final eager all-gather runs on the separate
-control mesh. This prevents a collective from overtaking an unretired send and
-avoids the byte-count mismatch behind the full-model boundary-all-gather copy
-fault. A missing RDMA/JACCL fabric is an error, not a performance-degrading
-fallback.
+`scripts/tensor_generate.py` initializes `backend="jaccl"` in strict mode and
+requires exactly two ranks. All attention and FFN shards execute concurrently,
+with their MLX tensor-parallel reductions carried by JACCL over Thunderbolt
+RDMA. A missing RDMA/JACCL fabric is an error, not a performance-degrading
+fallback. `scripts/distributed_generate.py` retains the separately proven
+point-to-point pipeline for diagnosis and regression testing.
 
 ## Status
 
@@ -676,8 +674,9 @@ fallback.
 - [x] latest stable MLX 0.32.0 + mlx-lm 0.31.3 environment pinned by `uv.lock`
 - [x] resumable 47/46-layer rank-local UVMAX downloader (about 384.5 GiB/rank)
 - [x] exact two-rank prefill and cached-decode parity on a miniature K3
+- [x] exact 64-token/32-step tensor parity over real two-host JACCL/RDMA
 - [x] production runner hard-requires JACCL and two ranks
-- [ ] full unpruned two-M3-Ultra JACCL generation and benchmark proof
+- [ ] full tensor-parallel two-M3-Ultra JACCL generation and canonical benchmark
 - [ ] AWQ re-run on a balanced calibration corpus (in progress)
 - [ ] tok/s re-measured for all published tiers after the wiring fix
 

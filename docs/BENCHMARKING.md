@@ -12,8 +12,8 @@ checkpoint revision, host topology, command, and machine-readable record.
 - MLX 0.32.0 and mlx-lm 0.31.3 from `uv.lock`.
 - `kernelpool/Kimi-K3-2bit-UVMAX` revision
   `edb5113218df612f4a92f95145680f3f8eacd375`.
-- Pipeline rank 1 `[0,47)` and rank 0 `[47,93)`.
-- `MLX_METAL_FAST_SYNCH=1` (set by `scripts/run_distributed.sh`).
+- Tensor-parallel rank-local checkpoint on each host; both execute all layers.
+- `MLX_METAL_FAST_SYNCH=1` (set by `scripts/run_tensor.sh` through the shared launcher).
 - Deterministic sampling (`temperature=0`, seed 0) unless the result explicitly
   studies another sampler.
 
@@ -33,7 +33,7 @@ checkpoint revision, host topology, command, and machine-readable record.
 One-off example:
 
 ```bash
-scripts/run_distributed.sh \
+scripts/run_tensor.sh \
   --run-id "$(git rev-parse --short HEAD)-factual-1" \
   --prompt 'Who is Albert Einstein?' \
   --max-tokens 256
@@ -42,7 +42,7 @@ scripts/run_distributed.sh \
 Canonical suite (one model load, warm-up, three prompts, three repetitions):
 
 ```bash
-scripts/run_distributed.sh \
+scripts/run_tensor.sh \
   --run-id "$(git rev-parse --short HEAD)-canonical" \
   --suite benchmarks/prompts.json \
   --warmup-tokens 32 \
@@ -90,6 +90,6 @@ Every optimization pull request must include:
   change touches distributed code.
 
 Prefer optimizations that reduce bytes read or JACCL synchronization without
-changing checkpoint quality. Keep experimental tensor/expert parallel results
-separate from the pipeline baseline until their node-local checkpoint format is
-reproducible within the internal SSD budget.
+changing checkpoint quality. Pipeline results are a separate serialized
+correctness baseline and must not be mixed with the primary tensor-parallel
+series.

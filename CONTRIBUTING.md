@@ -28,6 +28,11 @@ Distributed changes must also pass the tiny two-rank parity test:
 .venv/bin/python scripts/make_tiny_uvmax_fixture.py
 .venv/bin/mlx.launch --backend ring --hosts 127.0.0.1,127.0.0.1 -- \
   "$PWD/.venv/bin/python" scripts/distributed_smoke.py
+
+# Rank-local tensor conversion and 64-token/32-step TP parity.
+.venv/bin/python -m unittest tests.test_tensor_stage
+.venv/bin/mlx.launch -n 2 -- \
+  "$PWD/.venv/bin/python" scripts/distributed_tensor_smoke.py
 ```
 
 Ring is used only for local CI parity. Full-model performance or compatibility
