@@ -40,13 +40,13 @@ message containing the current hidden state and accumulated AttnRes blocks;
 the receiver reconstructs inverse-RMS state locally. Payload transfer and
 control synchronization use two independent JACCL backend instances, both on
 the same mandatory RDMA fabric. This is required because a large receive can
-become locally visible before the remote send retires. The receiver immediately
-posts a same-direction marker receive, allowing the sender to retire its
-payload and send the marker. Barriers and final all-gather use the second RDMA
-queue pair, so the first remains point-to-point until both payload operations
-finish. The stress test transfers the production-shaped 5 x 1 x 64 x 7168 BF16
-packet while synchronizing on the independent control mesh, then checks
-bit-exact miniature-model prefill and cached decode parity.
+become locally visible before the remote send retires. Rank 1 therefore keeps
+the send lazy on a dedicated CPU stream; rank 0 evaluates the receive to prove
+data arrival. Barriers and final all-gather run concurrently on a second CPU
+stream and second RDMA queue pair, so the payload queue never changes operation
+type while its send retires. The stress test transfers the production-shaped
+5 x 1 x 64 x 7168 BF16 packet while synchronizing on the independent control
+mesh, then checks bit-exact miniature-model prefill and cached decode parity.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source

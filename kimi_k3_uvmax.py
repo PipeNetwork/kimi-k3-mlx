@@ -898,6 +898,9 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             or self.pipeline_control_group.size() != self.pipeline_size
         ):
             raise ValueError("pipeline payload and control groups do not match")
+        self.pipeline_payload_stream = mx.new_stream(mx.cpu)
+        self.pipeline_control_stream = mx.new_stream(mx.cpu)
+        self._pipeline_pending_sends = []
         self.start_idx, self.end_idx = pipeline_bounds(
             len(self.layers), self.pipeline_size, self.pipeline_rank
         )
@@ -909,58 +912,45 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         marker = mx.distributed.all_sum(
             mx.ones((10,), dtype=mx.float32),
             group=self.pipeline_control_group,
-            stream=mx.cpu,
+            stream=self.pipeline_control_stream,
         )
         mx.eval(marker)
 
     def _pipeline_recv(self, template, source):
-        """Receive on the payload mesh, with a posted completion receive.
+        """Evaluate the payload receive, then synchronize the control mesh.
 
         A receive can become locally visible before the sender has retired the
-        corresponding RDMA work request.  Posting the next same-direction
-        receive keeps that queue progressing until the sender can retire the
-        payload and issue its completion marker.  The marker and the control
-        barrier use different queue pairs, so neither changes operation type
-        on an active payload queue.
+        corresponding RDMA work request.  The sender therefore remains lazy on
+        a dedicated payload CPU stream while this evaluated receive proves the
+        bytes arrived.  Control synchronization runs concurrently on a second
+        CPU stream and independent JACCL queue pair.
         """
         self._pipeline_barrier()
         value = mx.distributed.recv_like(
             template,
             source,
             group=self.pipeline_group,
-            stream=mx.cpu,
+            stream=self.pipeline_payload_stream,
         )
         mx.eval(value)
-        completed = mx.distributed.recv_like(
-            mx.zeros((10,), dtype=mx.float32),
-            source,
-            group=self.pipeline_group,
-            stream=mx.cpu,
-        )
-        mx.async_eval(completed)
         self._pipeline_barrier()
-        mx.eval(completed)
         return value
 
     def _pipeline_send(self, value, destination):
-        """Send a payload and same-direction completion marker."""
+        """Enqueue a lazy payload send while synchronizing the control mesh."""
         self._pipeline_barrier()
         sent = mx.distributed.send(
             value,
             destination,
             group=self.pipeline_group,
-            stream=mx.cpu,
+            stream=self.pipeline_payload_stream,
         )
-        mx.eval(sent)
-        completed = mx.distributed.send(
-            mx.ones((10,), dtype=mx.float32),
-            destination,
-            group=self.pipeline_group,
-            stream=mx.cpu,
-        )
-        mx.eval(completed)
+        mx.async_eval(sent)
+        # Retain the lazy graph for the life of the model; evaluating or
+        # releasing each send eagerly recreates the JACCL retirement deadlock.
+        self._pipeline_pending_sends.append(sent)
         self._pipeline_barrier()
-        return sent
+        return value
 
     def _pipeline_masks(self, h, cache):
         ssm_cache = attn_cache = None
@@ -1047,7 +1037,7 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             h = mx.distributed.all_gather(
                 h,
                 group=self.pipeline_control_group,
-                stream=mx.cpu,
+                stream=self.pipeline_control_stream,
             )[: h.shape[0]]
         return self.norm(h)
 

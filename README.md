@@ -649,10 +649,10 @@ scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 `scripts/distributed_generate.py` initializes `backend="jaccl"` with strict
 mode and requires exactly two ranks. Payloads and control collectives use two
 independent JACCL backend instances on the same RDMA fabric so a still-retiring
-point-to-point send can never share a queue pair with the next collective. The
-receiver pre-posts a same-direction completion marker before entering the
-control barrier, keeping the payload queue live until the sender retires. A
-missing RDMA/JACCL fabric is an error, not a performance-degrading fallback.
+point-to-point send can never share a queue pair with the next collective.
+Payload sends remain lazy on a dedicated CPU stream while the evaluated receive
+proves delivery; control collectives run concurrently on their own CPU stream.
+A missing RDMA/JACCL fabric is an error, not a performance-degrading fallback.
 
 ## Status
 
