@@ -2,14 +2,16 @@ import json
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import Mock, patch
+from unittest.mock import patch
 from pathlib import Path
 
 from scripts.durable_jaccl import (
     SAFE_RUN_ID,
     load_jaccl_hostfile,
+    screen_bootstrap,
     shell_worker,
     wait_for_local_coordinator,
+    wait_for_local_pid,
     wait_for_remote_pid,
 )
 
@@ -73,9 +75,8 @@ class TestDurableJaccl(unittest.TestCase):
     @patch("scripts.durable_jaccl.subprocess.run")
     def test_coordinator_readiness_does_not_connect(self, run):
         run.return_value = subprocess.CompletedProcess([], 0)
-        process = Mock()
-        process.poll.return_value = None
-        wait_for_local_coordinator("10.0.0.1", 32323, process, timeout=0.1)
+        with patch("scripts.durable_jaccl.rank_alive", return_value=True):
+            wait_for_local_coordinator("10.0.0.1", 32323, 1234, timeout=0.1)
         run.assert_called_once_with(
             [
                 "lsof",
@@ -87,11 +88,23 @@ class TestDurableJaccl(unittest.TestCase):
             stderr=subprocess.DEVNULL,
         )
 
+    @patch("scripts.durable_jaccl.local_text", return_value="1234")
+    def test_local_pid_is_published_by_detached_rank(self, local_text):
+        path = Path("/tmp/rank0.pid")
+        self.assertEqual(wait_for_local_pid(path), 1234)
+        local_text.assert_called_once_with(path)
+
     @patch("scripts.durable_jaccl.remote_text", return_value="1234")
     def test_remote_pid_is_published_by_detached_rank(self, remote_text):
         path = Path("/tmp/rank1.pid")
         self.assertEqual(wait_for_remote_pid("beast2.local", path), 1234)
         remote_text.assert_called_once_with("beast2.local", path)
+
+    def test_screen_bootstrap_redirects_without_losing_worker_script(self):
+        self.assertEqual(
+            screen_bootstrap("echo worker", Path("/tmp/rank 0.log")),
+            "exec </dev/null >>'/tmp/rank 0.log' 2>&1; echo worker",
+        )
 
 
 if __name__ == "__main__":
