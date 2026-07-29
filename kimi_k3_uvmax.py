@@ -908,14 +908,16 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         mx.eval(marker)
 
     def _pipeline_recv(self, template, source):
-        """Receive a pipeline packet and acknowledge its remote completion.
+        """Receive a pipeline packet and its same-direction completion marker.
 
         A receive can become locally visible before the sender has retired the
         corresponding RDMA work request.  Entering a collective in that window
-        deadlocks JACCL for packets larger than its eager path: the receiver is
-        already polling all-reduce while the sender is still polling send.  A
-        small reverse-direction acknowledgement keeps both peers in point-to-
-        point mode until the payload sender has completed.
+        deadlocks JACCL for packets larger than its eager path.  A reverse-
+        direction acknowledgement also deadlocks because both peers enter
+        send.  Instead, the receiver posts a second receive while the sender
+        finishes the payload and then sends a small marker in the same
+        direction.  The marker cannot be issued until the payload send has
+        retired, so it is a completion fence without changing queue direction.
         """
         self._pipeline_barrier()
         value = mx.distributed.recv_like(
@@ -925,18 +927,18 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(value)
-        acknowledged = mx.distributed.send(
-            mx.ones((10,), dtype=mx.float32),
+        completed = mx.distributed.recv_like(
+            mx.zeros((10,), dtype=mx.float32),
             source,
             group=self.pipeline_group,
             stream=mx.cpu,
         )
-        mx.eval(acknowledged)
+        mx.eval(completed)
         self._pipeline_barrier()
         return value
 
     def _pipeline_send(self, value, destination):
-        """Send a pipeline packet and wait for the receiver's acknowledgement."""
+        """Send a pipeline packet followed by a same-direction completion marker."""
         self._pipeline_barrier()
         sent = mx.distributed.send(
             value,
@@ -945,13 +947,13 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             stream=mx.cpu,
         )
         mx.eval(sent)
-        acknowledged = mx.distributed.recv_like(
-            mx.zeros((10,), dtype=mx.float32),
+        completed = mx.distributed.send(
+            mx.ones((10,), dtype=mx.float32),
             destination,
             group=self.pipeline_group,
             stream=mx.cpu,
         )
-        mx.eval(acknowledged)
+        mx.eval(completed)
         self._pipeline_barrier()
         return sent
 

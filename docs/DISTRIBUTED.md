@@ -38,12 +38,14 @@ because released mlx-lm generation samples on every rank. Vision weights are
 not downloaded for the text benchmark. The boundary sends one packed BF16
 message containing the current hidden state and accumulated AttnRes blocks;
 the receiver reconstructs inverse-RMS state locally. The transfer is fenced by
-CPU collectives and a reverse-direction point-to-point acknowledgement. The
-acknowledgement is required because a large receive can become locally visible
-before the remote send retires; changing that RDMA queue to a collective in
-that window deadlocks JACCL. The stress test transfers the production-shaped
-5 x 1 x 64 x 7168 BF16 packet before checking bit-exact miniature-model prefill
-and cached decode parity.
+CPU collectives and a same-direction point-to-point completion marker. The
+marker is required because a large receive can become locally visible before
+the remote send retires; changing that RDMA queue to a collective in that
+window deadlocks JACCL, while a reverse-direction acknowledgement can leave
+both peers blocked in `send`. The receiver therefore posts a marker receive
+while the sender finishes the payload and then sends the marker. The stress
+test transfers the production-shaped 5 x 1 x 64 x 7168 BF16 packet before
+checking bit-exact miniature-model prefill and cached decode parity.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source

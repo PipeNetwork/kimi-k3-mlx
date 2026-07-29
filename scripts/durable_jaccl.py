@@ -138,6 +138,15 @@ def screen_bootstrap(script: str, log: Path) -> str:
     return f"exec </dev/null >>{shlex.quote(str(log))} 2>&1; {script}"
 
 
+def remote_screen_command(name: str, bootstrap: str) -> str:
+    """Detach screen itself from SSH, not only the worker it launches."""
+    return (
+        f"/usr/bin/screen -dmS {shlex.quote(name)} "
+        f"/bin/bash -lc {shlex.quote(bootstrap)} "
+        "</dev/null >/dev/null 2>&1"
+    )
+
+
 def launch_screen(
     name: str,
     script: str,
@@ -148,18 +157,14 @@ def launch_screen(
     bootstrap = screen_bootstrap(script, log)
     if remote is None:
         subprocess.Popen(
-            ["/usr/bin/screen", "-DmS", name, "/bin/bash", "-lc", bootstrap],
+            ["/usr/bin/screen", "-dmS", name, "/bin/bash", "-lc", bootstrap],
             stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
     else:
-        ssh(
-            remote,
-            f"/usr/bin/screen -DmS {shlex.quote(name)} "
-            f"/bin/bash -lc {shlex.quote(bootstrap)}",
-        )
+        ssh(remote, remote_screen_command(name, bootstrap))
 
 
 def stop_screen(name: str, *, remote: str | None = None) -> None:

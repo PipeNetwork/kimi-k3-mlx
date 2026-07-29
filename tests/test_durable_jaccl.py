@@ -12,6 +12,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.durable_jaccl import (
     SAFE_RUN_ID,
     load_jaccl_hostfile,
+    remote_screen_command,
     screen_bootstrap,
     shell_worker,
     wait_for_local_coordinator,
@@ -108,6 +109,14 @@ class TestDurableJaccl(unittest.TestCase):
         self.assertEqual(
             screen_bootstrap("echo worker", Path("/tmp/rank 0.log")),
             "exec </dev/null >>'/tmp/rank 0.log' 2>&1; echo worker",
+        )
+
+    def test_remote_screen_detaches_its_own_ssh_descriptors(self):
+        command = remote_screen_command("rank one", "echo worker")
+        self.assertEqual(
+            command,
+            "/usr/bin/screen -dmS 'rank one' /bin/bash -lc 'echo worker' "
+            "</dev/null >/dev/null 2>&1",
         )
 
 
