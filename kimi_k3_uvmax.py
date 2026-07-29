@@ -927,18 +927,28 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
             )
 
         blocks = ResidualBlocks(self.args.rms_norm_eps) if self.use_attn_res else None
+        if size not in (1, 2):
+            raise ValueError(
+                f"Kimi-K3 UVMAX supports an unsharded model or exactly 2 ranks, got {size}"
+            )
+
         if blocks is not None and self.start_idx:
             batch, length, hidden = h.shape
             previous = (
                 self.start_idx + self.args.attn_res_block_size - 1
             ) // self.args.attn_res_block_size
-            # Pack the hidden state and AttnRes blocks into one RDMA message.
-            # The inverse RMS is cheap to reconstruct and avoids two extra
-            # latency-sensitive sends at every generated token.
+            # Rank 0 enters this collective before its local layers while rank
+            # 1 enters it after producing the boundary packet below.  A matched
+            # JACCL all-gather gives the lazy scheduler an unambiguous global
+            # order and avoids point-to-point send/collective reordering at
+            # full Kimi-K3 graph scale.  For two ranks it is one bidirectional
+            # RDMA exchange, and the unused rank-0 half is tiny versus compute.
             packet_template = mx.zeros(
                 (previous + 1, batch, length, hidden), dtype=h.dtype
             )
-            packet = mx.distributed.recv_like(packet_template, rank + 1)
+            gathered = mx.distributed.all_gather(packet_template)
+            packet_count = packet_template.shape[0]
+            packet = gathered[packet_count : 2 * packet_count]
             h = packet[0]
             blocks.raw = packet[1:]
             rawf = blocks.raw.astype(mx.float32)
@@ -946,7 +956,8 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
                 (rawf * rawf).mean(axis=-1) + self.args.rms_norm_eps
             )
         elif rank < size - 1:
-            h = mx.distributed.recv_like(h, rank + 1)
+            batch = h.shape[0]
+            h = mx.distributed.all_gather(mx.zeros_like(h))[batch : 2 * batch]
 
         ssm_mask, attn_mask = self._pipeline_masks(h, cache)
         for layer, layer_cache in zip(local_layers, cache):
@@ -969,10 +980,12 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         if rank != 0:
             if blocks is not None:
                 packet = mx.concatenate([h[None], blocks.raw], axis=0)
-                sent = mx.distributed.send(packet, rank - 1)
-                h = sent[0]
+                boundary = mx.distributed.all_gather(packet)
             else:
-                h = mx.distributed.send(h, rank - 1)
+                boundary = mx.distributed.all_gather(h)
+            # Keep the boundary collective in rank 1's graph even though only
+            # rank 0 consumes its payload.
+            h = mx.depends(h, boundary)
 
         # Generation samples on every rank.  Share rank zero's completed
         # hidden state so both samplers remain bit-for-bit synchronized.
