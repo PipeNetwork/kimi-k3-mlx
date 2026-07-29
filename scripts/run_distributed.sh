@@ -28,4 +28,4 @@ KIMI_RUN_ID="$RUN_ID" "$REPO_DIR/.venv/bin/mlx.launch" \
     --env MLX_METAL_FAST_SYNCH=1 \
     --env KIMI_HOSTFILE_SHA256="$HOSTFILE_SHA256" \
     --env KIMI_RUN_ID="$RUN_ID" \
-    -- "$PYTHON" scripts/distributed_generate.py "$@"
+    -- /usr/bin/caffeinate -dimsu "$PYTHON" scripts/distributed_generate.py "$@"
