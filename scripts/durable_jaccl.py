@@ -221,10 +221,12 @@ def wait_for_local_coordinator(
     pid: int,
     *,
     timeout: float = 60,
+    stable_for: float = 0,
 ) -> None:
     """Wait for rank 0 to listen without consuming JACCL's one peer socket."""
     deadline = time.monotonic() + timeout
     endpoint = f"TCP@{host}:{port}"
+    listening_since = None
     while time.monotonic() < deadline:
         if not rank_alive(None, pid):
             raise RuntimeError(
@@ -236,7 +238,12 @@ def wait_for_local_coordinator(
             stderr=subprocess.DEVNULL,
         )
         if listener.returncode == 0:
-            return
+            now = time.monotonic()
+            listening_since = listening_since or now
+            if now - listening_since >= stable_for:
+                return
+        else:
+            listening_since = None
         time.sleep(0.1)
     raise TimeoutError(
         f"rank 0 did not listen on {host}:{port} within {timeout:g} seconds"
@@ -305,6 +312,7 @@ def launch(args: argparse.Namespace) -> int:
             hostfile["hosts"][0]["ips"][0],
             args.port,
             local_pid,
+            stable_for=1.0,
         )
     except Exception:
         stop_screen(local_screen)
