@@ -907,7 +907,15 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         self.layers[: self.start_idx] = [None] * self.start_idx
 
     def _pipeline_recv(self, template, source):
-        """Receive the one-way boundary packet on its dedicated JACCL mesh."""
+        """Receive the FP32 boundary packet on its dedicated JACCL mesh.
+
+        The input embedding on rank 0 is BF16, but rank 1's MoE stage output
+        is FP32.  JACCL point-to-point operations exchange raw byte counts, so
+        deriving the receive dtype from the local embedding truncates the
+        message and leaves the sender polling forever.  FP32 is therefore an
+        explicit wire-format invariant rather than an inferred local dtype.
+        """
+        template = mx.zeros(template.shape, dtype=mx.float32)
         received = mx.distributed.recv_like(
             template,
             source,
@@ -918,7 +926,8 @@ class KimiK3TextModel(PipelineMixin, nn.Module):
         return received
 
     def _pipeline_send(self, value, destination):
-        """Materialize and retire the one-way boundary send before continuing."""
+        """Materialize and retire an FP32 boundary send before continuing."""
+        value = value.astype(mx.float32)
         value = mx.contiguous(value)
         mx.eval(value)
         sent = mx.distributed.send(

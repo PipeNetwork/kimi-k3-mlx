@@ -41,16 +41,21 @@ the receiver reconstructs inverse-RMS state locally. Boundary transfer and
 final hidden-state synchronization use two independent JACCL backend instances,
 both on the same mandatory RDMA fabric. After one initialization collective on
 each mesh, the payload mesh is point-to-point only: rank 1 fully materializes
-and eagerly sends the boundary packet, while rank 0 receives it and computes
-all 46 local MoE layers before any further communication. Rank 1 cannot enter
-the final synchronization until its send has retired. The second mesh then
-distributes rank 0's completed, row-contiguous hidden state with an eager
-all-gather. Keeping the one-way payload transfer and the final collective on
-different RDMA queue pairs avoids both the sender-retirement deadlock and the
-full-model `memmove` faults observed when the boundary itself was an
-all-gather. The stress test transfers the
-production-shaped 5 x 1 x 64 x 7168 BF16 packet before checking bit-exact
-miniature-model prefill and cached decode parity.
+and eagerly sends the boundary packet in an explicit FP32 wire format, while
+rank 0 allocates an identically shaped FP32 receive and computes all 46 local
+MoE layers before any further communication. This explicit dtype is required:
+rank 0's local embedding is BF16, but rank 1's actual post-MoE activation is
+FP32, and JACCL point-to-point calls match raw byte counts rather than tensor
+metadata. Inferring the receive dtype from the embedding consumed only half
+the payload and left the sender polling forever. Rank 1 cannot enter the final
+synchronization until its correctly matched send has retired. The second mesh
+then distributes rank 0's completed, row-contiguous hidden state with an eager
+all-gather. Keeping the matched one-way payload transfer and final collective
+on different RDMA queue pairs avoids the prior sender-retirement deadlock and
+the same byte-count mismatch that caused full-model boundary-all-gather
+`memmove` faults. The stress test starts with a production-shaped
+5 x 1 x 64 x 7168 BF16 caller tensor, proves its normalized FP32 wire transfer,
+then checks bit-exact miniature-model prefill and cached decode parity.
 
 The original source-to-2-bit route remains available through
 `scripts/convert.py` and `scripts/build_pipeline_stage.sh`. It downloads source

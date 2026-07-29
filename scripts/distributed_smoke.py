@@ -48,9 +48,12 @@ def run_boundary_probe(model, group, length: int, hidden_size: int) -> float:
     else:
         template = mx.zeros(shape, dtype=mx.bfloat16)
         transferred = model.model._pipeline_recv(template, 1)
+    if transferred.dtype != mx.float32:
+        raise AssertionError(f"boundary wire dtype is {transferred.dtype}, not FP32")
     error = mx.max(mx.abs(transferred.astype(mx.float32) - 1.25)).item()
     print(
-        f"[rank {rank}] boundary probe: shape={shape}, error={error:.3g}",
+        f"[rank {rank}] boundary probe: shape={shape}, "
+        f"wire_dtype={transferred.dtype}, error={error:.3g}",
         flush=True,
     )
     return error

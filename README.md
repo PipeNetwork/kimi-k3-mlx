@@ -650,11 +650,14 @@ scripts/run_distributed.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
 mode and requires exactly two ranks. Boundary and final-state transfers use
 two independent JACCL backend instances over the same RDMA fabric. After an
 initialization collective on each mesh, rank 1 sends the fully materialized
-boundary packet eagerly over the point-to-point-only payload mesh. Rank 0 then
-computes its complete stage before the final eager all-gather runs on the
-separate control mesh. This prevents a collective from overtaking an
-unretired send and avoids the full-model boundary-all-gather copy fault. A
-missing RDMA/JACCL fabric is an error, not a performance-degrading fallback.
+FP32 boundary packet eagerly over the point-to-point-only payload mesh. The
+wire dtype is explicit because rank 0's embedding is BF16 while rank 1's
+post-MoE activation is FP32; JACCL matches raw byte counts. Rank 0 then computes
+its complete stage before the final eager all-gather runs on the separate
+control mesh. This prevents a collective from overtaking an unretired send and
+avoids the byte-count mismatch behind the full-model boundary-all-gather copy
+fault. A missing RDMA/JACCL fabric is an error, not a performance-degrading
+fallback.
 
 ## Status
 
