@@ -202,14 +202,29 @@ class ShardWriter:
         return [f for f in os.listdir(self.out)
                 if f.startswith("model-") and f.endswith(".safetensors")]
 
-    def guard_fresh(self):
-        """Refuse to convert into a directory that already holds a build."""
+    def guard_fresh(self, overwrite: bool = False):
+        """Refuse to convert into a directory that already holds a build.
+
+        Rebuilding in place is legitimate (a converter change, a new profile at
+        the same path), so `overwrite` clears the old build rather than leaving
+        the caller to rm -rf a multi-TB directory by hand. What is never allowed
+        is writing a second build *alongside* the first, which is what happened
+        silently before this existed.
+        """
         stale = self._existing()
-        if stale:
+        if not stale:
+            return
+        if not overwrite:
             raise SystemExit(
                 f"{self.out} already holds {len(stale)} shard(s). Converting into it "
-                f"would interleave two builds. Delete it, choose another --out, or "
-                f"pass --resume to continue an interrupted run.")
+                f"would interleave two builds. Pass --overwrite to replace it, "
+                f"--resume to continue an interrupted run, or choose another --out.")
+        for f in stale:
+            os.remove(os.path.join(self.out, f))
+        for f in ("model.safetensors.index.json", PROGRESS):
+            fp = os.path.join(self.out, f)
+            if os.path.exists(fp):
+                os.remove(fp)
 
     def checkpoint(self, state: Dict):
         """Flush the buffer and journal what is durably on disk.
@@ -445,6 +460,7 @@ def convert(
     nonexpert_bits: Optional[int] = None,
     awq_scales: Optional[str] = None,
     resume: bool = False,
+    overwrite: bool = False,
 ):
     spec = profile_spec(profile, nonexpert_bits)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
@@ -510,7 +526,7 @@ def convert(
 
     # ---- resume
     if not resume:
-        writer.guard_fresh()
+        writer.guard_fresh(overwrite)
     state = writer.resume_from() if resume else None
     if state is not None:
         overrides.update(state.get("overrides", {}))
@@ -723,6 +739,8 @@ if __name__ == "__main__":
                          "keeps them bf16 by default: 114 GB on K3)")
     ap.add_argument("--resume", action="store_true",
                     help="continue an interrupted run from its last completed layer")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="delete an existing build at --out and convert it again")
     ap.add_argument("--awq-scales", default=None,
                     help="npz from scripts/awq.py; scales w1/w3 input channels "
                          "and folds the inverse into routed_expert_down_proj")
@@ -730,5 +748,8 @@ if __name__ == "__main__":
                     help="REAP plan from scripts/reap_plan.py; prunes experts "
                          "and renumbers the router to match")
     a = ap.parse_args()
+    if a.resume and a.overwrite:
+        raise SystemExit("--resume continues a build and --overwrite deletes it; "
+                         "pass one or the other")
     convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan,
-            a.nonexpert_bits, a.awq_scales, a.resume)
+            a.nonexpert_bits, a.awq_scales, a.resume, a.overwrite)
