@@ -18,6 +18,26 @@ REPO_OWNER = "pipenetwork"
 BASE = "moonshotai/Kimi-K3"
 
 
+def is_full_build(cfg) -> bool:
+    """A build with no `reap` block kept every expert."""
+    return "reap" not in cfg
+
+
+def full_profile(cfg) -> str:
+    """Which unpruned profile produced this build.
+
+    A bf16 build carries no `quantization` key at all -- that absence is the
+    whole signal, so it is read here rather than guessed from a filename.
+    """
+    q = cfg.get("quantization")
+    if not q:
+        return "bf16"
+    if q.get("mode") == "mxfp4":
+        return "mxfp4"
+    raise SystemExit(f"unpruned build with unexpected quantization {q}; "
+                     f"no card template covers it")
+
+
 def collect(path, plan_path, report_path):
     cfg = json.load(open(os.path.join(path, "config.json")))
     tc = cfg.get("text_config", cfg)
@@ -26,6 +46,11 @@ def collect(path, plan_path, report_path):
     size = sum(os.path.getsize(os.path.join(path, s)) for s in shards)
     counts = [c for c in tc.get("expert_counts", []) if c]
     reap = cfg.get("reap", {})
+    if is_full_build(cfg):
+        # Nothing was pruned, so there is no expert_counts list to read the
+        # geometry off. Take it from the config, the way the model itself does.
+        n_moe = tc["num_hidden_layers"] - tc.get("first_k_dense_replace", 1)
+        counts = [tc["num_experts"]] * n_moe
     plan = json.load(open(plan_path)) if plan_path and os.path.exists(plan_path) else {}
     report = open(report_path).read() if report_path and os.path.exists(report_path) else ""
     retained = ""
@@ -326,6 +351,160 @@ streaming REAP calibration harness. Weights remain under the Kimi K3 License.
 """
 
 
+FULL_CARD = """---
+license: other
+license_name: kimi-k3
+base_model: {BASE}
+base_model_relation: {relation}
+library_name: mlx
+pipeline_tag: text-generation
+tags:
+- mlx
+- moe
+- kimi
+- apple-silicon
+---
+
+# {name}
+
+**Kimi-K3 converted to MLX, complete -- every expert, no pruning.** {size_str}.
+
+Base: [{BASE}](https://huggingface.co/{BASE}) -- 2.78T total / 104B active,
+native-multimodal MoE with Kimi Delta Attention, Attention Residuals and a 1M
+context.
+
+{headline}
+
+## What this is
+
+{what}
+
+## Hardware -- read this before downloading
+
+This build needs **~{ram_str} of unified memory**. That is more than any single
+Apple Silicon machine holds: the largest is 512 GB. Running it means an MLX ring
+cluster with enough aggregate memory ({nodes}), and downloading it means
+{size_str} of disk.
+
+**If you want to run Kimi-K3 on hardware you own, you almost certainly want a
+REAP build instead of this one.** Those are pruned to fit a single 512 GB
+machine and are linked from the [collection]({collection}).
+
+This repo exists so the *complete* model is available in MLX format -- as a
+conversion source, as the reference for measuring what pruning and quantization
+cost, and for anyone with the hardware to run it whole.
+
+## Precision
+
+{precision}
+
+## Usage
+
+Requires **mlx-lm** plus the bundled `kimi_k3.py` loader (the architecture is not
+upstream yet). Copy it into mlx-lm's model directory after installing:
+
+```bash
+pip install mlx-lm
+python -c "import os, shutil, mlx_lm; from huggingface_hub import hf_hub_download; \
+shutil.copy(hf_hub_download('{owner}/{name}', 'kimi_k3.py'), \
+os.path.join(os.path.dirname(mlx_lm.__file__), 'models', 'kimi_k3.py'))"
+```
+
+Single-machine `mlx_lm.generate` will not load this build -- it does not fit.
+Use `mlx.launch` with the ring backend across enough nodes; `cluster_generate.py`
+in the converter repo is a worked example.
+
+`kimi_k3_vision.py` and `kimi_k3_vl/` ship alongside for the vision tower; the
+image path needs mlx-vlm and is not exercised by `mlx_lm.generate`.
+
+## Provenance
+
+Converted with [PipeNetwork/kimi-k3-mlx](https://github.com/PipeNetwork/kimi-k3-mlx)
+using a streaming converter -- the model never fits in memory at any stage, so
+experts are decoded and written one at a time. Weights remain under the Kimi K3
+License.
+"""
+
+MXFP4_HEADLINE = """This is a **lossless** conversion. Kimi-K3's routed experts ship from Moonshot
+as MXFP4, and MLX's native `mxfp4` mode uses the identical encoding, so the
+experts here are a **bit-exact byte copy of the source weights** -- not a
+requantization. Non-expert tensors are carried at the bf16 they were published
+in. Nothing in this repo is approximated."""
+
+MXFP4_WHAT = """The complete model in MLX layout: all {n_experts} experts across {n_layers} MoE
+layers, plus the vision tower and projector. Numerically identical to
+[{BASE}](https://huggingface.co/{BASE}) -- only the file layout and tensor naming
+differ, so mlx-lm can load it directly."""
+
+MXFP4_PRECISION = """**Routed experts: MXFP4, byte-for-byte from source.** `weight_packed` plus e8m0
+`weight_scale` at group 32, restacked per layer but never decoded and
+re-encoded.
+
+**Everything else: bf16, as published.** Attention, shared experts, latent
+projections, embeddings and the vision tower are copied unchanged.
+
+Requantizing the experts to affine 4-bit would cost ~9.8% mean relative error
+*and* produce a larger file (4.5 vs 4.25 bits/weight), which is why no affine
+4-bit tier of the full model is published."""
+
+BF16_HEADLINE = """**This build is not higher fidelity than the source, and it is not the one you
+want unless you know why you want it.** Kimi-K3's experts are published in
+MXFP4 and carry 4 bits of real information per weight. This build stores those
+same values in 16 bits -- the identical numbers in a wider container, at 3.4x the
+bytes. Nothing is recovered; nothing is added.
+
+For the same model at 1.56 TB with identical numerics, use
+[{owner}/Kimi-K3-MLX-mxfp4](https://huggingface.co/{owner}/Kimi-K3-MLX-mxfp4)."""
+
+BF16_WHAT = """An **unquantized reference artifact**. The MXFP4 routed experts are dequantized
+into dense bf16 and every other tensor is copied as-is, giving a build with no
+packed weights, no scales, and no `quantization` block anywhere.
+
+It exists for work that wants dense weights as a starting point: evaluating new
+quantization schemes, analysing expert weight distributions, or requantizing
+without re-implementing the MXFP4 decode. For inference it is strictly worse than
+the mxfp4 build -- same outputs, 3.4x the memory."""
+
+BF16_PRECISION = """**Routed experts: dense bf16**, dequantized from the source's MXFP4 (group 32,
+e8m0 scales). Each expert was decoded individually and verified bit-exact against
+an independent dequant of the source, including a check that each slice does
+*not* match its neighbour -- the stacking is per-expert, and an off-by-one there
+yields tensors of the right dtype and shape holding the wrong expert.
+
+**Everything else: bf16, as published**, unchanged from source.
+
+There is no `quantization` key in `config.json`, because nothing here is
+quantized."""
+
+
+def full_model_card(name, d):
+    cfg = d["cfg"]
+    profile = full_profile(cfg)
+    tc = d["tc"]
+    size = d["size"]
+    size_str = f"{size / 1e12:.2f} TB" if size >= 1e12 else f"{size / 1e9:.0f} GB"
+    # 128 GB nodes cannot dedicate all of it to weights; ~120 GB is what the
+    # cluster script actually fits per rank.
+    nodes = f"~{max(2, -(-int(size / 1e9) // 120))} nodes at 128 GB, or fewer larger ones"
+    sub = dict(BASE=BASE, owner=REPO_OWNER, name=name,
+               n_experts=tc.get("num_experts"), n_layers=d["n_layers"])
+    if profile == "mxfp4":
+        headline, what, precision = MXFP4_HEADLINE, MXFP4_WHAT, MXFP4_PRECISION
+        relation = "quantized"
+    else:
+        # bf16 is a widening of the source's own values, not a quantization of
+        # them; "quantized" would be an outright false claim on the hub.
+        headline, what, precision = BF16_HEADLINE, BF16_WHAT, BF16_PRECISION
+        relation = "finetune"
+    return FULL_CARD.format(
+        BASE=BASE, owner=REPO_OWNER, name=name, relation=relation,
+        size_str=size_str, ram_str=size_str, nodes=nodes,
+        headline=headline.format(**sub), what=what.format(**sub),
+        precision=precision.format(**sub),
+        collection="https://huggingface.co/collections/pipenetwork",
+    )
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--path", required=True)
@@ -346,12 +525,23 @@ def main():
 
     name = a.name or os.path.basename(a.path.rstrip("/"))
     d = collect(a.path, a.plan, a.report)
-    card = model_card(name, d, parse_smoke(a.smoke_log), a.prev_tok_s)
+    # A full build has no prune ratio, no calibration corpus and no saliency
+    # numbers, and the REAP card is largely made of exactly those. It gets its
+    # own template rather than a pile of conditionals.
+    if is_full_build(d["cfg"]):
+        card = full_model_card(name, d)
+    else:
+        card = model_card(name, d, parse_smoke(a.smoke_log), a.prev_tok_s)
     with open(os.path.join(a.path, "README.md"), "w") as f:
         f.write(card)
     print(f"wrote model card -> {a.path}/README.md")
-    print(f"  {name}: {d['size']/1e9:.0f} GB, {d['shards']} shards, "
-          f"{d['kept']}/{d['src_experts']} experts x {d['n_layers']} layers")
+    if is_full_build(d["cfg"]):
+        print(f"  {name}: {d['size']/1e12:.2f} TB, {d['shards']} shards, "
+              f"{full_profile(d['cfg'])}, all {d['kept']} experts "
+              f"x {d['n_layers']} layers")
+    else:
+        print(f"  {name}: {d['size']/1e9:.0f} GB, {d['shards']} shards, "
+              f"{d['kept']}/{d['src_experts']} experts x {d['n_layers']} layers")
 
     if a.readme_only:
         from huggingface_hub import HfApi
