@@ -39,8 +39,28 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_kernel, gated_delta_ops
 from .mla import MultiLinear
-from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
+
+try:
+    from .pipeline import PipelineMixin
+except ImportError:
+    # mlx-lm predating models/pipeline.py. This file ships inside every
+    # published build, so a hard import would make an older mlx-lm unable to
+    # load K3 *at all* -- a worse failure than lacking multi-node support, which
+    # is what is actually missing. KimiK3Model.pipeline() overrides the upstream
+    # method anyway (its offsets are wrong for K3), so only the attributes and
+    # the pipeline_layers view are needed here.
+    class PipelineMixin:  # type: ignore[no-redef]
+        def __init__(self):
+            super().__init__()
+            self.pipeline_rank = 0
+            self.pipeline_size = 1
+            self.start_idx = 0
+            self.end_idx = None
+
+        @property
+        def pipeline_layers(self):
+            return self.layers[self.start_idx : self.end_idx]
 
 
 @dataclass
