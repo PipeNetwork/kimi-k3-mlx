@@ -22,6 +22,7 @@
 # reference init code is simply stale w.r.t. the released weights; the shapes are
 # authoritative. tests/test_kimi_k3.py asserts this against the real shard.
 
+import os
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -38,6 +39,7 @@ from .base import (
 from .cache import ArraysCache, KVCache
 from .gated_delta import gated_delta_kernel, gated_delta_ops
 from .mla import MultiLinear
+from .pipeline import PipelineMixin
 from .switch_layers import SwitchGLU
 
 
@@ -365,12 +367,20 @@ class KimiDeltaAttention(nn.Module):
         self.o_proj = nn.Linear(self.projection_dim, h, bias=False)
 
     def _compute_g(self, a: mx.array) -> mx.array:
-        # log-decay, then the safe-gate clamp (fla's `lower_bound`), then exp.
-        log_g = -mx.exp(self.A_log.reshape(1, self.head_dim).astype(mx.float32)) * nn.softplus(
-            a + self.dt_bias.reshape(self.num_heads, self.head_dim)
-        )
+        # [K3-5] fla/ops/kda/gate.py indexes A_log by HEAD -- `tl.load(A_log + i_h)`
+        # over a grid whose second dim is H = g.shape[-2] = num_heads -- and
+        # broadcasts it as a scalar across head_dim. The checkpoint ships A_log
+        # padded out to head_dim with entries [num_heads:] all exactly zero, which
+        # is what makes the per-channel reading look plausible from the shape alone.
+        A_log = self.A_log[: self.num_heads].reshape(self.num_heads, 1).astype(mx.float32)
+        s = a + self.dt_bias.reshape(self.num_heads, self.head_dim)
         if self.gate_lower_bound is not None:
-            log_g = mx.maximum(log_g, self.gate_lower_bound)
+            # fla's safe-gate is a different function, not a clamp on the softplus
+            # form: `b_gate = lower_bound * tl.sigmoid(exp(b_A) * b_s)`. No softplus
+            # appears in that branch at all, and K3 sets gate_lower_bound=-5.0.
+            log_g = self.gate_lower_bound * mx.sigmoid(mx.exp(A_log) * s)
+        else:
+            log_g = -mx.exp(A_log) * nn.softplus(s)
         return mx.exp(log_g)
 
     def __call__(self, x, mask=None, cache=None):
@@ -693,6 +703,31 @@ def bank_split_in_layer(args: ModelArgs, idx: int) -> int:
     return int(args.expert_bank_split[idx])
 
 
+def pipeline_span(n_layers: int, size: int, rank: int, extra_mode: Optional[str] = None):
+    """Layer range owned by `rank`. Rank size-1 holds the first layers, rank 0 the last.
+
+    Offsets are a cumulative sum. mlx-lm's PipelineMixin instead computes
+    `(size - rank - 1) * layers_per_rank` from each rank's own count *after* the
+    uneven-split bump, as though every rank held that many; with 93 layers over
+    4 ranks that silently skips layers 69..71 and leaves rank 0 three short.
+
+    Where the remainder lands is a memory decision, not a cosmetic one: 24 layers
+    is ~118 GB resident against 23 at ~113 GB, and the nodes differ in free RAM.
+    `K3_PIPELINE_EXTRA=high` moves it to the highest ranks; default is upstream's
+    lowest-rank rule.
+    """
+    if extra_mode is None:
+        extra_mode = os.environ.get("K3_PIPELINE_EXTRA", "low")
+    high = extra_mode.lower() == "high"
+    base, extra = divmod(n_layers, size)
+    counts = [
+        base + (1 if ((r >= size - extra) if high else (r < extra)) else 0)
+        for r in range(size)
+    ]
+    start = sum(counts[rank + 1:])
+    return start, start + counts[rank]
+
+
 def remap_checkpoint(
     weights: Dict[str, mx.array],
     args: ModelArgs,
@@ -854,7 +889,7 @@ class KimiDecoderLayer(nn.Module):
         return prefix_sum + z, block_residual
 
 
-class KimiK3Model(nn.Module):
+class KimiK3Model(PipelineMixin, nn.Module):
     def __init__(self, args: ModelArgs):
         super().__init__()
         self.args = args
@@ -863,6 +898,8 @@ class KimiK3Model(nn.Module):
         self.norm = nn.RMSNorm(args.hidden_size, eps=args.rms_norm_eps)
 
         self.use_attn_res = args.attn_res_block_size is not None
+        self.attn_res_block_size = args.attn_res_block_size
+        self.pipeline_group = None
         if self.use_attn_res:
             self.output_attn_res = AttnResProj(args.hidden_size)
 
@@ -871,6 +908,52 @@ class KimiK3Model(nn.Module):
         self.attn_idx = next(
             i for i in range(len(self.layers)) if (i + 1) not in kda_layers
         )
+
+    def pipeline(self, group):
+        """Split layers across ranks; rank 0 keeps the tail (see PipelineMixin).
+
+        The mask indices are positions within this rank's slice, and a rank may
+        hold only one attention flavour -- 24 of 93 layers are MLA, so a 4-way
+        split can hand a rank no MLA layer at all. `None` then means "build no
+        mask of that kind", which __call__ handles.
+        """
+        # NOTE: deliberately not calling super().pipeline(). mlx-lm's
+        # PipelineMixin computes `start_idx = (size - rank - 1) * layers_per_rank`
+        # using each rank's own count *after* the uneven-split bump, as though
+        # every rank held that many. With 93 layers over 4 ranks that yields
+        # [0:23] [23:46] [46:69] [72:93] -- layers 69..71 are never executed and
+        # nothing reports it. Offsets have to be a cumulative sum instead.
+        self.pipeline_rank = rank = group.rank()
+        self.pipeline_size = size = group.size()
+        self.pipeline_group = group
+
+        self.start_idx, self.end_idx = pipeline_span(len(self.layers), size, rank)
+
+        self.layers = self.layers[: self.end_idx]
+        self.layers[: self.start_idx] = [None] * self.start_idx
+
+        self.ssm_idx = None
+        self.attn_idx = None
+        for e, layer in enumerate(self.pipeline_layers):
+            if self.ssm_idx is None and layer.is_linear:
+                self.ssm_idx = e
+            elif self.attn_idx is None and not layer.is_linear:
+                self.attn_idx = e
+            if self.ssm_idx is not None and self.attn_idx is not None:
+                break
+
+    @property
+    def _blocks_before_slice(self) -> int:
+        """How many residuals the AttnRes stack already holds at this rank's
+        first layer -- i.e. how many multiples of the block size precede it.
+
+        [K3-2] The stack is threaded through every layer, so a pipeline boundary
+        has to carry it alongside the hidden state. The receiving rank cannot
+        infer its width from the payload, but it is fixed by start_idx.
+        """
+        if not self.use_attn_res:
+            return 0
+        return -(-self.start_idx // self.attn_res_block_size)  # ceil
 
     def __call__(
         self,
@@ -881,24 +964,99 @@ class KimiK3Model(nn.Module):
         # inputs_embeds lets the multimodal wrapper splice image features in
         # place of the <|media_pad|> placeholder before the stack runs.
         h = self.embed_tokens(inputs) if inputs_embeds is None else inputs_embeds
+        layers = self.pipeline_layers
         if cache is None:
-            cache = [None] * len(self.layers)
+            cache = [None] * len(layers)
 
-        ssm_mask = create_ssm_mask(h, cache[self.ssm_idx])
-        attn_mask = create_attention_mask(h, cache[self.attn_idx], return_array=True)
+        ssm_mask = (
+            create_ssm_mask(h, cache[self.ssm_idx]) if self.ssm_idx is not None else None
+        )
+        attn_mask = (
+            create_attention_mask(h, cache[self.attn_idx], return_array=True)
+            if self.attn_idx is not None
+            else None
+        )
 
         B, T, H = h.shape
+        rank, size = self.pipeline_rank, self.pipeline_size
         block_residual = mx.zeros((B * T, 0, H), dtype=h.dtype) if self.use_attn_res else None
 
-        for layer, layer_cache in zip(self.layers, cache):
+        # [K3-2] One transfer per boundary carrying the hidden state stacked on
+        # top of the AttnRes residuals. Sending them as two arrays would leave
+        # the second send's ordering -- and whether it survives dead-code
+        # elimination at all -- dependent on how the graph happens to be walked.
+        # Both sides must agree on the wire dtype. `h` enters as bf16 from the
+        # quantized embedding but comes back from the KDA/MLA layers as float32,
+        # so sizing the recv template from the local h.dtype makes the receiver
+        # read half the bytes and reinterpret them -- NaN, not an error. An
+        # unquantized model is float32 throughout and never trips this.
+        wire = mx.float32
+
+        def _pack(h_, br_):
+            if not self.use_attn_res:
+                return h_.reshape(B * T, 1, H).astype(wire)
+            return mx.concatenate(
+                [h_.reshape(B * T, 1, H).astype(wire), br_.astype(wire)], axis=1
+            )
+
+        def _unpack(packed):
+            h_ = packed[:, :1, :].reshape(B, T, H)
+            return h_, (packed[:, 1:, :] if self.use_attn_res else None)
+
+        if rank < size - 1:
+            template = mx.zeros(
+                (B * T, self._blocks_before_slice + 1, H), dtype=wire
+            )
+            h, block_residual = _unpack(
+                mx.distributed.recv_like(template, rank + 1, group=self.pipeline_group)
+            )
+
+        debug_nan = os.environ.get("K3_DEBUG_NAN")
+        if debug_nan:
+            mx.eval(h)
+            ok = bool(mx.isfinite(h.astype(mx.float32)).all().item())
+            print(f"[nan-probe rank {rank}] input to layers[{self.start_idx}:"
+                  f"{self.end_idx}] finite={ok} "
+                  f"mean|h|={mx.abs(h.astype(mx.float32)).mean().item():.4e}", flush=True)
+
+        for i, (layer, layer_cache) in enumerate(zip(layers, cache)):
             mask = ssm_mask if layer.is_linear else attn_mask
             h, block_residual = layer(h, mask, layer_cache, block_residual)
+            if debug_nan:
+                mx.eval(h)
+                h32 = h.astype(mx.float32)
+                if not bool(mx.isfinite(h32).all().item()):
+                    li = self.start_idx + i
+                    print(f"[nan-probe rank {rank}] FIRST NON-FINITE at layer {li} "
+                          f"({'KDA' if layer.is_linear else 'MLA'}, "
+                          f"{'MoE' if layer.is_moe else 'dense'}) "
+                          f"nan={int(mx.sum(mx.isnan(h32)).item())} "
+                          f"inf={int(mx.sum(mx.isinf(h32)).item())}", flush=True)
+                    debug_nan = None  # report once per rank
 
-        if self.use_attn_res:
-            h = self.output_attn_res(
-                h.reshape(-1, H), block_residual, self.args.rms_norm_eps
-            ).reshape(B, T, H)
-        return self.norm(h)
+        if rank != 0:
+            sent = mx.distributed.send(
+                _pack(h, block_residual), rank - 1, group=self.pipeline_group
+            )
+            # keep the send in the graph: nothing downstream reads it
+            h = mx.depends(h, sent)
+            if cache and cache[-1] is not None:
+                if hasattr(cache[-1], "keys"):
+                    cache[-1].keys = mx.depends(cache[-1].keys, sent)
+                else:
+                    cache[-1][0] = mx.depends(cache[-1][0], sent)
+        else:
+            # rank 0 owns the final layers, so only it holds the completed stack
+            if self.use_attn_res:
+                h = self.output_attn_res(
+                    h.reshape(-1, H), block_residual, self.args.rms_norm_eps
+                ).reshape(B, T, H)
+            h = self.norm(h)
+
+        if size > 1:
+            # rank 0's rows come first, so this broadcasts its result to everyone
+            h = mx.distributed.all_gather(h, group=self.pipeline_group)[:B]
+        return h
 
 
 class Model(nn.Module):
@@ -926,7 +1084,8 @@ class Model(nn.Module):
 
     @property
     def layers(self):
-        return self.model.layers
+        # the rank's own slice: cache sizing and make_cache must match what runs
+        return self.model.pipeline_layers
 
     def make_cache(self):
         return [

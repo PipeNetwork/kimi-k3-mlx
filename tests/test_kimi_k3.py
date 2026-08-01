@@ -163,29 +163,120 @@ class TestAttnRes(unittest.TestCase):
 
 
 class TestKdaGate(unittest.TestCase):
-    def test_A_log_broadcasts_per_channel(self):
-        """[K3-5] A_log is [head_dim] and must broadcast along the head-dim axis."""
+    def test_A_log_broadcasts_per_head(self):
+        """[K3-5] A_log is stored as [head_dim] but the decay is PER-HEAD.
+
+        fla/ops/kda/gate.py loads it with `tl.load(A_log + i_h)` over a grid whose
+        second dimension is H = g.shape[-2] = num_heads, then broadcasts that
+        scalar across head_dim. The checkpoint pads the tensor out to head_dim
+        with zeros, which is what makes a per-channel reading look plausible from
+        the shape alone; scripts/parity_probe_gate2.py scores this form at
+        cosine 0.99999 against the kernel and every alternative below 0.95.
+        """
         args = tiny_args()
         kda = kimi_k3.KimiDeltaAttention(args, 0)
         self.assertEqual(kda.A_log.shape, (kda.head_dim,))
-        a = mx.zeros((2, 3, kda.num_heads, kda.head_dim))
-        g = kda._compute_g(a)
-        self.assertEqual(g.shape, (2, 3, kda.num_heads, kda.head_dim))
-        # identical across heads, varying across channels
-        kda.A_log = mx.arange(kda.head_dim).astype(mx.float32) * 0.1
+        # s must be nonzero: the gate is sigmoid(exp(A_log) * s), so at s == 0 it
+        # collapses to sigmoid(0) for every head and A_log drops out entirely.
+        a = mx.ones((2, 3, kda.num_heads, kda.head_dim))
+        self.assertEqual(kda._compute_g(a).shape, (2, 3, kda.num_heads, kda.head_dim))
+
+        # distinct value per head, zero-padded exactly as the checkpoint ships it
+        per_head = (mx.arange(kda.num_heads) + 1).astype(mx.float32) * 0.3
+        pad = mx.zeros((kda.head_dim - kda.num_heads,))
+        kda.A_log = mx.concatenate([per_head, pad])
         kda.dt_bias = mx.zeros((kda.projection_dim,))
         g = kda._compute_g(a)
-        self.assertLess(float(mx.abs(g[:, :, 0, :] - g[:, :, 1, :]).max()), 1e-6)
-        self.assertGreater(float(mx.abs(g[0, 0, 0, 0] - g[0, 0, 0, -1])), 1e-3)
 
-    def test_gate_lower_bound_clamps(self):
+        # constant across channels within a head, varying across heads
+        self.assertLess(float(mx.abs(g[:, :, 0, :] - g[:, :, 0, :1]).max()), 1e-6)
+        self.assertGreater(float(mx.abs(g[0, 0, 0, 0] - g[0, 0, 1, 0])), 1e-3)
+
+    def test_A_log_padding_is_ignored(self):
+        """Entries [num_heads:] are padding; touching them must change nothing."""
         args = tiny_args()
         kda = kimi_k3.KimiDeltaAttention(args, 0)
-        kda.A_log = mx.full((kda.head_dim,), 5.0)  # exp(5) ~ 148 -> huge decay
+        kda.dt_bias = mx.zeros((kda.projection_dim,))
+        a = mx.ones((1, 2, kda.num_heads, kda.head_dim))
+
+        base = mx.concatenate([
+            mx.ones((kda.num_heads,)) * 0.5, mx.zeros((kda.head_dim - kda.num_heads,))
+        ])
+        kda.A_log = base
+        before = kda._compute_g(a)
+        # garbage in the padded tail
+        kda.A_log = mx.concatenate([
+            base[: kda.num_heads], mx.ones((kda.head_dim - kda.num_heads,)) * 9.0
+        ])
+        after = kda._compute_g(a)
+        self.assertLess(float(mx.abs(before - after).max()), 1e-7)
+
+    def test_gate_lower_bound_saturates(self):
+        """fla's safe-gate branch is `lower_bound * sigmoid(exp(A_log) * s)`.
+
+        Not a clamp on the softplus form -- there is no softplus in that branch at
+        all. It approaches lower_bound by saturation, so g bottoms out at exp(-5).
+        """
+        args = tiny_args()
+        kda = kimi_k3.KimiDeltaAttention(args, 0)
+        kda.A_log = mx.full((kda.head_dim,), 5.0)  # exp(5) ~ 148
         kda.dt_bias = mx.full((kda.projection_dim,), 5.0)
         g = kda._compute_g(mx.zeros((1, 1, kda.num_heads, kda.head_dim)))
-        # clamped at exp(-5), not exp(-148*softplus(5))
         self.assertAlmostEqual(float(g.min()), float(mx.exp(mx.array(-5.0))), places=5)
+
+        # and the other way: a large negative argument saturates the sigmoid to 0,
+        # leaving the decay at 1.0 rather than the softplus form's exp(-something)
+        kda.dt_bias = mx.full((kda.projection_dim,), -5.0)
+        g = kda._compute_g(mx.zeros((1, 1, kda.num_heads, kda.head_dim)))
+        self.assertAlmostEqual(float(g.max()), 1.0, places=5)
+
+
+class TestPipelineSpan(unittest.TestCase):
+    """The split must cover every layer exactly once, for both remainder modes.
+
+    mlx-lm's PipelineMixin does not: for 93 layers over 4 ranks it yields
+    [0:23] [23:46] [46:69] [72:93], dropping 69..71 with no error. Nothing in a
+    forward pass notices -- the model just quietly skips three layers.
+    """
+
+    def _check(self, n, size, mode):
+        spans = [kimi_k3.pipeline_span(n, size, r, mode) for r in range(size)]
+        for lo, hi in spans:
+            self.assertGreaterEqual(hi, lo)
+        front = sorted(spans)
+        self.assertEqual(front[0][0], 0, f"{mode} {n}/{size}: gap at start")
+        self.assertEqual(front[-1][1], n, f"{mode} {n}/{size}: gap at end")
+        for (a_lo, a_hi), (b_lo, b_hi) in zip(front, front[1:]):
+            self.assertEqual(a_hi, b_lo, f"{mode} {n}/{size}: gap/overlap {a_hi}!={b_lo}")
+        self.assertEqual(sum(hi - lo for lo, hi in spans), n)
+        return spans
+
+    def test_gapless_both_modes(self):
+        for n, size in ((93, 4), (93, 2), (93, 3), (93, 5), (6, 4), (8, 3), (4, 4), (1, 1)):
+            for mode in ("low", "high"):
+                self._check(n, size, mode)
+
+    def test_extra_moves_off_rank0(self):
+        """K3_PIPELINE_EXTRA=high must take the 24th layer off rank 0."""
+        low = [kimi_k3.pipeline_span(93, 4, r, "low") for r in range(4)]
+        high = [kimi_k3.pipeline_span(93, 4, r, "high") for r in range(4)]
+        self.assertEqual(low[0][1] - low[0][0], 24)
+        self.assertEqual(high[0][1] - high[0][0], 23)
+        self.assertEqual(high[3][1] - high[3][0], 24)
+
+    def test_env_var_selects_mode(self):
+        import os as _os
+        prev = _os.environ.get("K3_PIPELINE_EXTRA")
+        try:
+            _os.environ["K3_PIPELINE_EXTRA"] = "high"
+            self.assertEqual(kimi_k3.pipeline_span(93, 4, 0), (70, 93))
+            _os.environ["K3_PIPELINE_EXTRA"] = "low"
+            self.assertEqual(kimi_k3.pipeline_span(93, 4, 0), (69, 93))
+        finally:
+            if prev is None:
+                _os.environ.pop("K3_PIPELINE_EXTRA", None)
+            else:
+                _os.environ["K3_PIPELINE_EXTRA"] = prev
 
 
 class TestForward(unittest.TestCase):
