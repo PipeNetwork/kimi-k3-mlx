@@ -7,6 +7,11 @@ at a time and never holds more than a few tens of GB.
 
 Profiles
 --------
+  bf16    nothing quantized: experts dequantized MXFP4 -> dense bf16, rest as-is.
+          5.33 TB. Note this is NOT higher fidelity than the source -- the experts
+          carry 4 bits of real information and this stores the same values in 16,
+          so it is an unquantized reference artifact, not a better model. It is
+          ~10x the RAM of a 512 GB Mac and cannot be run there.
   mxfp4   experts copied BYTE-FOR-BYTE from the source (lossless); rest bf16
   3bit    experts affine 3-bit g64; rest 4-bit; router gate 8-bit
   2bit    experts affine 2-bit g64; rest 4-bit; router gate 8-bit
@@ -41,6 +46,7 @@ from mlx_lm.models import kimi_k3  # noqa: E402
 
 FP4_GROUP = 32
 SHARD_BYTES = 5 * 1024**3
+PROGRESS = "_progress.json"
 
 # Copied verbatim from the source repo into every output.
 PASSTHROUGH_FILES = [
@@ -55,6 +61,17 @@ PASSTHROUGH_FILES = [
 
 
 def profile_spec(profile: str, nonexpert_bits: Optional[int] = None) -> Dict[str, object]:
+    if profile == "bf16":
+        # Nothing quantized anywhere: routed experts are dequantized out of MXFP4
+        # into dense bf16 and everything else is copied as-is.
+        #
+        # Be clear about what this is and is not. The experts hold 4 bits of real
+        # information per weight; widening them to 16 stores the SAME values in 4x
+        # the bytes, so this build is not higher fidelity than the source -- it is
+        # the same numbers in a wider container, at 5.33 TB against the source's
+        # 1.56 TB. It exists as an unquantized reference/requant artifact, not as
+        # something to run: it is ~10x the RAM of a 512 GB Mac.
+        return dict(expert=None, other=None, gate=None, global_q=None)
     if profile == "mxfp4":
         # Non-experts default to bf16 (114 GB on K3 -- 2% of params but 23% of a
         # REAP'd build's footprint). --nonexpert-bits trades that down; they were
@@ -181,6 +198,58 @@ class ShardWriter:
         self.buf, self.nbytes = {}, 0
         gc.collect()
 
+    def _existing(self) -> List[str]:
+        return [f for f in os.listdir(self.out)
+                if f.startswith("model-") and f.endswith(".safetensors")]
+
+    def guard_fresh(self):
+        """Refuse to convert into a directory that already holds a build."""
+        stale = self._existing()
+        if stale:
+            raise SystemExit(
+                f"{self.out} already holds {len(stale)} shard(s). Converting into it "
+                f"would interleave two builds. Delete it, choose another --out, or "
+                f"pass --resume to continue an interrupted run.")
+
+    def checkpoint(self, state: Dict):
+        """Flush the buffer and journal what is durably on disk.
+
+        Called at layer boundaries. A multi-TB conversion runs for hours; without
+        this one interruption costs the entire run.
+        """
+        self.flush()
+        tmp = os.path.join(self.out, PROGRESS + ".tmp")
+        with open(tmp, "w") as f:
+            json.dump({**state, "shards": self.shards,
+                       "weight_map": self.weight_map, "total": self.total}, f)
+        os.replace(tmp, os.path.join(self.out, PROGRESS))     # atomic swap
+
+    def resume_from(self) -> Optional[Dict]:
+        """Restore writer state from the journal, or None if there is none."""
+        p = os.path.join(self.out, PROGRESS)
+        if not os.path.exists(p):
+            if self._existing():
+                raise SystemExit(
+                    f"{self.out} already holds shards but no {PROGRESS}: it is a "
+                    f"finished (or foreign) build, not an interrupted one. Resuming "
+                    f"would write a second copy of every tensor alongside the first. "
+                    f"Delete it or pick another --out.")
+            return None
+        with open(p) as f:
+            st = json.load(f)
+        self.shards = [(name, keys) for name, keys in st["shards"]]
+        self.weight_map = dict(st["weight_map"])
+        self.total = st["total"]
+        # Any shard the journal does not name was written by an automatic
+        # size-flush *after* the last checkpoint. Replaying its layer would
+        # write those tensors again, so the orphans have to go -- otherwise the
+        # build carries duplicate tensors in shards nothing indexes.
+        known = {name for name, _ in self.shards}
+        for f in os.listdir(self.out):
+            if f.startswith("model-") and f.endswith(".safetensors") and f not in known:
+                os.remove(os.path.join(self.out, f))
+        return st
+
     def finalize(self):
         self.flush()
         n = len(self.shards)
@@ -241,6 +310,30 @@ def expert_stack_passthrough(
     out = {"weight": mx.stack(packed), "scales": mx.stack(scales)}
     mx.eval(out["weight"], out["scales"])
     return out
+
+
+def expert_stack_dense(
+    reader: ShardReader, layer: int, w: str, n_experts, keep=None
+) -> Dict[str, mx.array]:
+    """MXFP4 -> dense bf16, one expert at a time (bounded memory).
+
+    Same dequantization as :func:`expert_stack_requant` but stopping there, so no
+    second lossy pass is applied. Emits a single dense ``weight`` with no
+    scales/biases, which is what an unquantized module expects.
+    """
+    base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
+    order = keep if keep is not None else range(n_experts)
+    out = []
+    for e in order:
+        packed = reader.get(f"{base}.{e}.{w}.weight_packed").view(mx.uint32)
+        scale = reader.get(f"{base}.{e}.{w}.weight_scale")
+        dense = mx.dequantize(packed, scale, group_size=FP4_GROUP, bits=4, mode="mxfp4")
+        mx.eval(dense)
+        out.append(dense)
+        del packed, scale
+    stacked = {"weight": mx.stack(out)}
+    mx.eval(*stacked.values())
+    return stacked
 
 
 def expert_stack_requant(
@@ -351,6 +444,7 @@ def convert(
     prune_plan: Optional[str] = None,
     nonexpert_bits: Optional[int] = None,
     awq_scales: Optional[str] = None,
+    resume: bool = False,
 ):
     spec = profile_spec(profile, nonexpert_bits)
     raw_cfg = json.load(open(os.path.join(src, "config.json")))
@@ -414,13 +508,24 @@ def convert(
         if quantizable(w, s) and s != spec["global_q"]:
             overrides[module_path] = dict(s)
 
+    # ---- resume
+    if not resume:
+        writer.guard_fresh()
+    state = writer.resume_from() if resume else None
+    if state is not None:
+        overrides.update(state.get("overrides", {}))
+        print(f"[{profile}] resuming after layer {state['done_layers'] - 1} "
+              f"({writer.total / 1e12:.3f} TB already written)", flush=True)
+
     # ---- embeddings
-    emb = reader.get("language_model.model.embed_tokens.weight")
-    emit_quantized("model.embed_tokens", emb, "other")
-    del emb
+    if state is None:
+        emb = reader.get("language_model.model.embed_tokens.weight")
+        emit_quantized("model.embed_tokens", emb, "other")
+        del emb
+        writer.checkpoint({"done_layers": 0, "overrides": overrides})
 
     # ---- layers
-    for i in range(n_layers):
+    for i in range(state["done_layers"] if state else 0, n_layers):
         lt0 = time.time()
         prefix = f"language_model.model.layers.{i}"
         raw = {
@@ -477,13 +582,15 @@ def convert(
             for w, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
                 es = spec["expert"]
                 if bank is None:
-                    if es["mode"] == "mxfp4":
+                    if es is None:
+                        t = expert_stack_dense(reader, i, w, args.num_experts, keep)
+                    elif es["mode"] == "mxfp4":
                         t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
                     else:
                         t = expert_stack_requant(reader, i, w, args.num_experts, es,
                                                  keep, awq[i] if awq is not None else None)
                     emit(f"{moe}.{dst}", t)
-                    if es != spec["global_q"]:
+                    if es is not None and es != spec["global_q"]:
                         overrides[f"{moe}.{dst}"] = dict(es)
                     del t
                 else:
@@ -511,6 +618,7 @@ def convert(
             f"elapsed {(time.time() - t0) / 60:6.1f}m",
             flush=True,
         )
+        writer.checkpoint({"done_layers": i + 1, "overrides": overrides})
 
     # ---- vision tower + projector
     #
@@ -543,6 +651,10 @@ def convert(
         emit_quantized("lm_head", reader.get("language_model.lm_head.weight"), "other")
 
     writer.finalize()
+    # the journal describes pre-rename shards; a finished build must not look resumable
+    jp = os.path.join(out, PROGRESS)
+    if os.path.exists(jp):
+        os.remove(jp)
 
     # ---- config + aux files
     cfg = dict(raw_cfg)
@@ -550,9 +662,17 @@ def convert(
     if "text_config" in cfg:
         cfg["text_config"] = dict(cfg["text_config"])
         cfg["text_config"].pop("quantization_config", None)
-    q = dict(spec["global_q"])
-    q.update(overrides)
-    cfg["quantization"] = q
+    if spec["global_q"] is None:
+        # bf16 profile: nothing is quantized, so the build must carry NO
+        # `quantization` block. Emitting an empty one would make the loader
+        # construct quantized modules and then fail to find scales/biases.
+        cfg.pop("quantization", None)
+        if overrides:
+            raise SystemExit(f"bf16 profile produced per-tensor overrides: {list(overrides)}")
+    else:
+        q = dict(spec["global_q"])
+        q.update(overrides)
+        cfg["quantization"] = q
     if expert_counts is not None:
         tc = cfg.setdefault("text_config", cfg)
         tc["expert_counts"] = expert_counts
@@ -595,12 +715,14 @@ if __name__ == "__main__":
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--profile", required=True,
-                    choices=["mxfp4", "3bit", "2bit", "mixed2"])
+                    choices=["bf16", "mxfp4", "3bit", "2bit", "mixed2"])
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers (smoke testing)")
     ap.add_argument("--nonexpert-bits", type=int, default=None,
                     help="quantize non-expert tensors to N bits (mxfp4 profile "
                          "keeps them bf16 by default: 114 GB on K3)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue an interrupted run from its last completed layer")
     ap.add_argument("--awq-scales", default=None,
                     help="npz from scripts/awq.py; scales w1/w3 input channels "
                          "and folds the inverse into routed_expert_down_proj")
@@ -608,4 +730,5 @@ if __name__ == "__main__":
                     help="REAP plan from scripts/reap_plan.py; prunes experts "
                          "and renumbers the router to match")
     a = ap.parse_args()
-    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan, a.nonexpert_bits, a.awq_scales)
+    convert(a.src, a.out, a.profile, a.limit_layers, a.prune_plan,
+            a.nonexpert_bits, a.awq_scales, a.resume)
