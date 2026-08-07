@@ -3,10 +3,16 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-REMOTE_HOST="${KIMI_REMOTE_HOST:-beast2.local}"
 HOSTFILE="${KIMI_HOSTFILE:-hosts-jaccl.json}"
 PYTHON="${KIMI_PYTHON:-.venv/bin/python}"
 CONFIG_TOOL="$(dirname "$PYTHON")/mlx.distributed_config"
+REMOTE_HOST="${KIMI_REMOTE_HOST:-}"
+if [[ -z "$REMOTE_HOST" && -f "$HOSTFILE" ]]; then
+    REMOTE_HOST="$("$PYTHON" -c \
+        'import json,sys; print(json.load(open(sys.argv[1]))["hosts"][1]["ssh"])' \
+        "$HOSTFILE")"
+fi
+REMOTE_HOST="${REMOTE_HOST:-beast2.local}"
 
 if ! /usr/bin/ibv_devinfo | grep -q 'PORT_ACTIVE'; then
     echo "No active local Thunderbolt RDMA port. Connect the two Studios with Thunderbolt 5." >&2
