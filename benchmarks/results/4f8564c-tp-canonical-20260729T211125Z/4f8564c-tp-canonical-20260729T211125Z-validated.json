@@ -1,0 +1,351 @@
+{
+  "generation_tps": {
+    "max": 3.648905162711819,
+    "median": 3.6323820138215024,
+    "min": 3.4356957213461397
+  },
+  "peak_memory_gb": 414.302452949,
+  "prompt_tps": {
+    "max": 50.86521416600997,
+    "median": 47.911494161533284,
+    "min": 43.71452441757702
+  },
+  "records": [
+    {
+      "case_id": "factual",
+      "generation_tokens": 256,
+      "generation_tps": 3.648905162711819,
+      "peak_memory_gb": 414.14650926,
+      "prompt_tps": 45.137938719593315,
+      "rank_generation_tps": [
+        3.648917759944918,
+        3.648905162711819
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        45.137938719593315,
+        45.35362590617298
+      ],
+      "repetition": 1,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-factual-r1"
+    },
+    {
+      "case_id": "code",
+      "generation_tokens": 256,
+      "generation_tps": 3.6407050866789583,
+      "peak_memory_gb": 414.203679332,
+      "prompt_tps": 47.911494161533284,
+      "rank_generation_tps": [
+        3.64071616036944,
+        3.6407050866789583
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        47.939129726790526,
+        47.911494161533284
+      ],
+      "repetition": 1,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-code-r1"
+    },
+    {
+      "case_id": "reasoning",
+      "generation_tokens": 256,
+      "generation_tps": 3.634751704886758,
+      "peak_memory_gb": 414.302452949,
+      "prompt_tps": 50.71162806723021,
+      "rank_generation_tps": [
+        3.6347717994643625,
+        3.634751704886758
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        50.729680969543494,
+        50.71162806723021
+      ],
+      "repetition": 1,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-reasoning-r1"
+    },
+    {
+      "case_id": "factual",
+      "generation_tokens": 256,
+      "generation_tps": 3.4356957213461397,
+      "peak_memory_gb": 414.136498804,
+      "prompt_tps": 45.927336930088046,
+      "rank_generation_tps": [
+        3.435703237193891,
+        3.4356957213461397
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        45.927336930088046,
+        45.93229702609109
+      ],
+      "repetition": 2,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-factual-r2"
+    },
+    {
+      "case_id": "code",
+      "generation_tokens": 256,
+      "generation_tps": 3.618436146337443,
+      "peak_memory_gb": 414.192418132,
+      "prompt_tps": 46.93782909559435,
+      "rank_generation_tps": [
+        3.618453117913002,
+        3.618436146337443
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        46.95769992827116,
+        46.93782909559435
+      ],
+      "repetition": 2,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-code-r2"
+    },
+    {
+      "case_id": "reasoning",
+      "generation_tokens": 256,
+      "generation_tps": 3.616318695999387,
+      "peak_memory_gb": 414.302450901,
+      "prompt_tps": 50.845467392262506,
+      "rank_generation_tps": [
+        3.6163304562652008,
+        3.616318695999387
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        50.84567576096272,
+        50.845467392262506
+      ],
+      "repetition": 2,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-reasoning-r2"
+    },
+    {
+      "case_id": "factual",
+      "generation_tokens": 256,
+      "generation_tps": 3.4815873741236354,
+      "peak_memory_gb": 414.147164748,
+      "prompt_tps": 43.71452441757702,
+      "rank_generation_tps": [
+        3.4816251672756877,
+        3.4815873741236354
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        43.72685278053977,
+        43.71452441757702
+      ],
+      "repetition": 3,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-factual-r3"
+    },
+    {
+      "case_id": "code",
+      "generation_tokens": 256,
+      "generation_tps": 3.638459837990925,
+      "peak_memory_gb": 414.203657516,
+      "prompt_tps": 47.93942587210465,
+      "rank_generation_tps": [
+        3.6384701632921503,
+        3.638459837990925
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        47.98804031393882,
+        47.93942587210465
+      ],
+      "repetition": 3,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-code-r3"
+    },
+    {
+      "case_id": "reasoning",
+      "generation_tokens": 256,
+      "generation_tps": 3.6323820138215024,
+      "peak_memory_gb": 414.290167037,
+      "prompt_tps": 50.86521416600997,
+      "rank_generation_tps": [
+        3.6323944091437865,
+        3.6323820138215024
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        50.86627719567287,
+        50.86521416600997
+      ],
+      "repetition": 3,
+      "run_id": "4f8564c-tp-canonical-20260729T211125Z-reasoning-r3"
+    }
+  ],
+  "run_id": "4f8564c-tp-canonical-20260729T211125Z",
+  "schema": 1,
+  "validated_rank_agreement": true
+}

@@ -11,16 +11,13 @@
 #   [K3-2] Attention Residuals (AttnRes) rank-1 [1,H] score projections, block 12
 #   [K3-3] Stable LatentMoE              routed experts live in a 3584-d latent
 #   [K3-4] q-LoRA + output-gated MLA     q_a/q_b rank 1536, sigmoid g_proj
-#   [K3-5] per-channel KDA decay         A_log is [head_dim], not [num_heads]
+#   [K3-5] per-head KDA decay            A_log storage is padded to [head_dim]
 #
 # NOTE on [K3-5]: the reference `modeling_kimi_linear.py` allocates
-# `A_log = Parameter(log(empty(num_heads)))` — i.e. [96] — but every checkpoint
-# shard ships A_log as [128] == head_dim, while b_proj is [96, H] and dt_bias is
-# [12288] == 96*128. fla's kernel broadcasts A_log against g of shape
-# (B,T,96,128), so a length-128 vector can only align with the trailing head-dim
-# axis. The decay rate is therefore per-channel and shared across heads. The
-# reference init code is simply stale w.r.t. the released weights; the shapes are
-# authoritative. tests/test_kimi_k3.py asserts this against the real shard.
+# `A_log = Parameter(log(empty(num_heads)))` — i.e. [96] — while the checkpoint
+# stores 128 values. CUDA parity established that entries [96:128] are zero
+# padding: fla indexes `A_log + i_h` and broadcasts one scalar across head_dim.
+# tests/test_kimi_k3.py pins both the per-head broadcast and ignored padding.
 
 import os
 from dataclasses import dataclass, field
@@ -746,6 +743,15 @@ def pipeline_span(n_layers: int, size: int, rank: int, extra_mode: Optional[str]
     ]
     start = sum(counts[rank + 1:])
     return start, start + counts[rank]
+
+
+def pipeline_bounds(num_layers: int, size: int, rank: int) -> tuple[int, int]:
+    """Two-node conversion split with equal MoE counts on the target Studios.
+
+    The extra input-side layer is K3's sole dense layer, so [0, 47) and [47, 93)
+    each contain exactly 46 expensive MoE layers.
+    """
+    return pipeline_span(num_layers, size, rank, "high")
 
 
 def remap_checkpoint(

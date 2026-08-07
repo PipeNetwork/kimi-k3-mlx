@@ -1,0 +1,51 @@
+name: Benchmark result
+description: Submit a reproducible Kimi-K3 performance result
+title: "[benchmark] "
+labels: [benchmark]
+body:
+  - type: markdown
+    attributes:
+      value: Read docs/BENCHMARKING.md first. Full-model distributed claims require JACCL over Thunderbolt RDMA.
+  - type: input
+    id: commit
+    attributes:
+      label: Code commit
+    validations:
+      required: true
+  - type: input
+    id: checkpoint
+    attributes:
+      label: Checkpoint and immutable revision
+    validations:
+      required: true
+  - type: textarea
+    id: hardware
+    attributes:
+      label: Hardware, macOS, and topology
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Exact command
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: records
+    attributes:
+      label: JSON records and summary
+      description: Attach or link every raw rank record; report median and range.
+    validations:
+      required: true
+  - type: checkboxes
+    id: proof
+    attributes:
+      label: Proof checklist
+      options:
+        - label: Both ranks reported JACCL and the RDMA link was active.
+          required: true
+        - label: Tiny distributed parity and the full test suite passed.
+          required: true
+        - label: Output was coherent and the run did not page-fault/thrash or OOM.
+          required: true

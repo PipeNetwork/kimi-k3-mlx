@@ -8,7 +8,7 @@
 # Usage: scripts/build_reap.sh [KEEP_FRACTION] [MODE] [PROFILE]
 #   scripts/build_reap.sh 0.27 uniform mxfp4
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 PY="${PY:-python3}"
 SRC="${SRC:-$PWD/Kimi-K3-src}"
 KEEP="${1:-0.27}"

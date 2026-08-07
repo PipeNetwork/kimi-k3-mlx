@@ -1,0 +1,55 @@
+{
+  "generation_tps": {
+    "max": 3.7493107532193735,
+    "median": 3.7493107532193735,
+    "min": 3.7493107532193735
+  },
+  "peak_memory_gb": 414.121718225,
+  "prompt_tps": {
+    "max": 10.418586513823724,
+    "median": 10.418586513823724,
+    "min": 10.418586513823724
+  },
+  "records": [
+    {
+      "case_id": "prompt",
+      "generation_tokens": 32,
+      "generation_tps": 3.7493107532193735,
+      "peak_memory_gb": 414.121718225,
+      "prompt_tps": 10.418586513823724,
+      "rank_generation_tps": [
+        3.7493116318030717,
+        3.7493107532193735
+      ],
+      "rank_hardware": [
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 541165879296,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        },
+        {
+          "architecture": "applegpu_g15d",
+          "device_name": "Apple M3 Ultra",
+          "machine": "arm64",
+          "max_buffer_length": 373662154752,
+          "max_recommended_working_set_size": 498216206336,
+          "memory_size": 549755813888,
+          "resource_limit": 499000
+        }
+      ],
+      "rank_prompt_tps": [
+        12.84799353237445,
+        10.418586513823724
+      ],
+      "repetition": 1,
+      "run_id": "4f8564c-tp-full-smoke-20260729T210927Z"
+    }
+  ],
+  "run_id": "4f8564c-tp-full-smoke-20260729T210927Z",
+  "schema": 1,
+  "validated_rank_agreement": true
+}

@@ -1,0 +1,169 @@
+{
+  "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+  "max_tokens": 64,
+  "prompt": "Explain why the sky appears blue in two sentences.",
+  "records": [
+    {
+      "aggregate_generation_tps": 1.6504259293336103,
+      "completion_tokens": 64,
+      "concurrency": 1,
+      "parity_sha256": [
+        "dca34679a8866c9573614e4e2c764584c044a02986213d9d2124d084c671a3e5"
+      ],
+      "request_latency_seconds": {
+        "max": 38.7703946250258,
+        "median": 38.7703946250258,
+        "min": 38.7703946250258
+      },
+      "server_batch_generation_tps": [
+        2.1299185737302033
+      ],
+      "server_batch_sizes": [
+        1
+      ],
+      "trial": 1,
+      "wall_seconds": 38.77786870801356
+    },
+    {
+      "aggregate_generation_tps": 3.845431681825642,
+      "completion_tokens": 128,
+      "concurrency": 2,
+      "parity_sha256": [
+        "cf10a17ce74eb89e2c2f3b093fd8b7a2cc13c7ed92f43c10311e4b181ee315c2"
+      ],
+      "request_latency_seconds": {
+        "max": 33.27641458297148,
+        "median": 33.275141895515844,
+        "min": 33.273869208060205
+      },
+      "server_batch_generation_tps": [
+        4.2633758908697255
+      ],
+      "server_batch_sizes": [
+        2
+      ],
+      "trial": 1,
+      "wall_seconds": 33.28624991700053
+    },
+    {
+      "aggregate_generation_tps": 8.05240235026112,
+      "completion_tokens": 256,
+      "concurrency": 4,
+      "parity_sha256": [
+        "fe1f9d48394704a5e4cbdf0ce984bf97cbd15926c235c56e378c7f6dfa382763"
+      ],
+      "request_latency_seconds": {
+        "max": 31.79140154190827,
+        "median": 31.791303895472083,
+        "min": 31.79123737500049
+      },
+      "server_batch_generation_tps": [
+        9.183420254620708
+      ],
+      "server_batch_sizes": [
+        4
+      ],
+      "trial": 1,
+      "wall_seconds": 31.791754667065106
+    },
+    {
+      "aggregate_generation_tps": 12.526963440121602,
+      "completion_tokens": 512,
+      "concurrency": 8,
+      "parity_sha256": [
+        "e90a49429a4479559bfc6d9963e1f9b217f479767e7f63ed8f291be9e5832972"
+      ],
+      "request_latency_seconds": {
+        "max": 40.87124316603877,
+        "median": 40.870854896027595,
+        "min": 40.87049274996389
+      },
+      "server_batch_generation_tps": [
+        15.441284931834623
+      ],
+      "server_batch_sizes": [
+        8
+      ],
+      "trial": 1,
+      "wall_seconds": 40.871836374979466
+    },
+    {
+      "aggregate_generation_tps": 19.895196933734795,
+      "completion_tokens": 1024,
+      "concurrency": 16,
+      "parity_sha256": [
+        "0eece349a351a7e1087f9051498b641f8ab47112482ad3210b2756fe97a6cafe"
+      ],
+      "request_latency_seconds": {
+        "max": 51.468718165997416,
+        "median": 51.46790070796851,
+        "min": 51.46708349999972
+      },
+      "server_batch_generation_tps": [
+        28.175006852738075
+      ],
+      "server_batch_sizes": [
+        16
+      ],
+      "trial": 1,
+      "wall_seconds": 51.46970916702412
+    },
+    {
+      "aggregate_generation_tps": 25.172663863057142,
+      "completion_tokens": 2048,
+      "concurrency": 32,
+      "parity_sha256": [
+        "9545a7ccc2b7ea89fbb44f491548cdd16b8f75a63a3ca9bee86aae004a751e54"
+      ],
+      "request_latency_seconds": {
+        "max": 81.35616437497083,
+        "median": 81.3545392494998,
+        "min": 81.33318425004836
+      },
+      "server_batch_generation_tps": [
+        40.30317582151234
+      ],
+      "server_batch_sizes": [
+        32
+      ],
+      "trial": 1,
+      "wall_seconds": 81.3580958750099
+    }
+  ],
+  "run_id": "server-benchmark-20260807T063609Z",
+  "schema": 1,
+  "summary": {
+    "1": {
+      "max": 1.6504259293336103,
+      "median_aggregate_generation_tps": 1.6504259293336103,
+      "min": 1.6504259293336103
+    },
+    "16": {
+      "max": 19.895196933734795,
+      "median_aggregate_generation_tps": 19.895196933734795,
+      "min": 19.895196933734795
+    },
+    "2": {
+      "max": 3.845431681825642,
+      "median_aggregate_generation_tps": 3.845431681825642,
+      "min": 3.845431681825642
+    },
+    "32": {
+      "max": 25.172663863057142,
+      "median_aggregate_generation_tps": 25.172663863057142,
+      "min": 25.172663863057142
+    },
+    "4": {
+      "max": 8.05240235026112,
+      "median_aggregate_generation_tps": 8.05240235026112,
+      "min": 8.05240235026112
+    },
+    "8": {
+      "max": 12.526963440121602,
+      "median_aggregate_generation_tps": 12.526963440121602,
+      "min": 12.526963440121602
+    }
+  },
+  "trials": 1
+}
+

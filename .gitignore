@@ -3,6 +3,9 @@ __pycache__/
 *.safetensors
 .venv/
 out/
+work/
+weights/
+hosts-jaccl*.json
 Kimi-K3-src/
 *.log
 .DS_Store

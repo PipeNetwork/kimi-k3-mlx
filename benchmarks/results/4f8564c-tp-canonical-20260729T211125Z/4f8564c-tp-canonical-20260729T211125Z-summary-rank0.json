@@ -1,0 +1,30 @@
+{
+  "backend": "jaccl",
+  "generation_tps": {
+    "max": 3.648917759944918,
+    "median": 3.6323944091437865,
+    "min": 3.435703237193891
+  },
+  "peak_memory_gb": 414.302450901,
+  "prompt_tps": {
+    "max": 50.86627719567287,
+    "median": 47.939129726790526,
+    "min": 43.72685278053977
+  },
+  "rank": 0,
+  "records": [
+    "4f8564c-tp-canonical-20260729T211125Z-factual-r1",
+    "4f8564c-tp-canonical-20260729T211125Z-code-r1",
+    "4f8564c-tp-canonical-20260729T211125Z-reasoning-r1",
+    "4f8564c-tp-canonical-20260729T211125Z-factual-r2",
+    "4f8564c-tp-canonical-20260729T211125Z-code-r2",
+    "4f8564c-tp-canonical-20260729T211125Z-reasoning-r2",
+    "4f8564c-tp-canonical-20260729T211125Z-factual-r3",
+    "4f8564c-tp-canonical-20260729T211125Z-code-r3",
+    "4f8564c-tp-canonical-20260729T211125Z-reasoning-r3"
+  ],
+  "run_id": "4f8564c-tp-canonical-20260729T211125Z",
+  "schema": 1,
+  "strategy": "tensor-parallel",
+  "transport": "thunderbolt-rdma"
+}

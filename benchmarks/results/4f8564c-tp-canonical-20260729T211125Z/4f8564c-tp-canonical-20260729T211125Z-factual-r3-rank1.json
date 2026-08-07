@@ -1,0 +1,71 @@
+{
+  "backend": "jaccl",
+  "case_id": "factual",
+  "checkpoint": {
+    "repo": "kernelpool/Kimi-K3-2bit-UVMAX",
+    "revision": "edb5113218df612f4a92f95145680f3f8eacd375",
+    "total_parameters": 2779483539072,
+    "weight_bytes": 816773159296
+  },
+  "code": {
+    "commit": "4f8564c82330eda311af5ab40d3e72455bc987aa",
+    "dirty": false
+  },
+  "communication": {
+    "collective_group": "jaccl-rdma",
+    "mode": "tensor-parallel-all-reduce"
+  },
+  "generation_tokens": 256,
+  "generation_tps": 3.4815873741236354,
+  "hardware": {
+    "architecture": "applegpu_g15d",
+    "device_name": "Apple M3 Ultra",
+    "machine": "arm64",
+    "max_buffer_length": 373662154752,
+    "max_recommended_working_set_size": 498216206336,
+    "memory_size": 549755813888,
+    "resource_limit": 499000
+  },
+  "host": "Beast2-2.local",
+  "jaccl_hostfile_sha256": "81be04f169485a14247164b25fc0b130513bbefbe03c153c0c2cb63320a9c236",
+  "load_seconds": 55.43023191700013,
+  "max_tokens": 256,
+  "mlx_metal_fast_synch": "1",
+  "peak_memory_gb": 414.147164748,
+  "platform": "macOS-26.5.2-arm64-arm-64bit-Mach-O",
+  "prompt": "Who is Albert Einstein? Give a concise but complete answer.",
+  "prompt_tokens": 100,
+  "prompt_tps": 43.71452441757702,
+  "rank": 1,
+  "raw_prompt": false,
+  "rdma": {
+    "active_ports": [
+      "rdma_en3"
+    ]
+  },
+  "repetition": 3,
+  "run_id": "4f8564c-tp-canonical-20260729T211125Z-factual-r3",
+  "sampling": {
+    "min_p": 0.0,
+    "temperature": 0.0,
+    "top_k": 0,
+    "top_p": 0.0
+  },
+  "schema": 1,
+  "seed": 2,
+  "stage": {
+    "rank": 1,
+    "world_size": 2
+  },
+  "stage_gib": 383.3356832517311,
+  "strategy": "tensor-parallel",
+  "suite_run_id": "4f8564c-tp-canonical-20260729T211125Z",
+  "text": "The user is asking a simple factual question about Albert Einstein. They want a concise but complete answer. This is a straightforward request that doesn't require any tools beyond thinking.\n\nLet me think about what a concise but complete answer about Albert Einstein should include:\n\n1. Who he was: German-born theoretical physicist\n2. Dates: 1879-1955\n3. Major achievements:\n   - Theory of relativity (special relativity 1905, general relativity 1915)\n   - E=mc\u00b2 (mass-energy equivalence)\n   - Nobel Prize in Physics 1921 (awarded for photoelectric effect, not relativity)\n   - Contributions to quantum mechanics (though he was skeptical of some aspects)\n4. Historical significance:\n   - One of the most influential scientists of all time\n   - His work revolutionized understanding of space, time, gravity\n   - Contributed to development of atomic theory\n   - Famous for the Einstein letter to Roosevelt about atomic weapons (1939)\n   - Later advocated for nuclear disarmament\n5. Personal details:\n   - Born in Ulm, Germany\n   - Emigrated to the US in 1933 (fleeing Nazi persecution)\n   - Became US citizen in 1940",
+  "transport": "thunderbolt-rdma",
+  "versions": {
+    "mlx": "0.32.0",
+    "mlx_lm": "0.31.3"
+  },
+  "warmup_tokens": 32,
+  "world_size": 2
+}

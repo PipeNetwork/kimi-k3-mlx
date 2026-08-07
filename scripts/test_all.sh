@@ -3,8 +3,13 @@
 # The register step matters: tests import `mlx_lm.models.kimi_k3`, so editing
 # the local file without reinstalling silently tests the previous version.
 set -uo pipefail
-cd "$(dirname "$0")/.."
-PY="${PY:-python3}"
+cd "$(dirname "$0")/.." || exit 1
+if [ -x .venv/bin/python ]; then
+  DEFAULT_PY=.venv/bin/python
+else
+  DEFAULT_PY=python3
+fi
+PY="${PY:-$DEFAULT_PY}"
 scripts/install_model.sh "$PY" >/dev/null
 # A suite that produces no result must FAIL, not pass quietly. This used to
 # grep for ^Ran/^OK/^FAILED and test only for the word FAILED, so anything that
@@ -15,7 +20,11 @@ scripts/install_model.sh "$PY" >/dev/null
 fail=0
 for t in tests/test_*.py; do
   printf "%-34s " "$(basename "$t")"
-  raw=$("$PY" -W ignore "$t" 2>&1); rc=$?
+  # Directly executing tests/test_*.py puts tests/ rather than the repository
+  # root at sys.path[0]. Keep the project root importable so tests can exercise
+  # the real scripts package consistently from a clean shell.
+  raw=$(PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PWD" \
+      "$PY" -W ignore "$t" 2>&1); rc=$?
   # unittest prints Ran/OK/FAILED. Suites that are plain scripts rather than
   # unittest (the mlx.launch pipeline checks) report a shouted verdict line such
   # as "PIPELINE PARITY OK" or "PARAM-KEY CHECK OK"; match that shape generally

@@ -1,0 +1,54 @@
+Licensing status and scope
+==========================
+
+This repository combines work from several sources and is not distributed
+under one project-wide license. The applicable terms depend on the file and
+provenance described below and in NOTICE.md.
+
+1. PipeNetwork inherited code
+-----------------------------
+
+Code inherited from PipeNetwork/kimi-k3-mlx, including later changes merged
+from that repository, remains copyright its respective authors. As of upstream
+commit 20a4fb101ce81380ab8af0036743d49e7256c521, that repository does not contain
+an explicit top-level software license. This repository does not grant rights
+to that inherited code. Obtain permission from its copyright holder unless an
+applicable license is provided upstream.
+
+2. Moonshot Kimi-K3 material
+----------------------------
+
+Kimi-K3 model weights, converted weights, configuration, and Moonshot-derived
+reference code are governed by the Kimi K3 License in:
+
+    LICENSES/Kimi-K3.txt
+
+The license includes conditions for certain commercial Model-as-a-Service uses
+and large commercial products. Read it before use or redistribution.
+
+3. Apple MLX-LM-derived material
+--------------------------------
+
+Files retaining an Apple copyright notice, including the MLX-LM-derived UVMAX
+loader and tool parser identified in NOTICE.md, are governed by Apple's MIT
+License in:
+
+    LICENSES/MLX-LM-MIT.txt
+
+4. Original fork additions
+--------------------------
+
+Copyright (c) 2026 Michal Komar and contributors
+
+Original, separable code, tests, benchmark tooling, and documentation first
+authored in michalkomar/kimi-k3-mlx-distributed are offered under the MIT
+License in:
+
+    LICENSES/Fork-Additions-MIT.txt
+
+This grant applies only to copyright held by those contributors. It does not
+relicense inherited code, model weights, modifications inseparable from an
+upstream work, or third-party material. When a file contains retained copyright
+or license headers, those notices control that material.
+
+See NOTICE.md for exact origins, commits, and attribution.

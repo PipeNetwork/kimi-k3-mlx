@@ -7,7 +7,7 @@
 #
 # Usage: scripts/build_all.sh [profile ...]      (default: all four)
 set -uo pipefail
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit
 PY="${PY:-python3}"
 SRC="${SRC:-$PWD/Kimi-K3-src}"
 OUTDIR="${OUTDIR:-$PWD/out}"

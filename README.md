@@ -1,4 +1,37 @@
-# kimi-k3-mlx
+# Kimi-K3 MLX Distributed
+
+This is a real GitHub fork of
+[PipeNetwork/kimi-k3-mlx](https://github.com/PipeNetwork/kimi-k3-mlx), focused
+on the fastest reproducible **unpruned Kimi-K3 inference across two 512 GiB M3
+Ultra Mac Studios**. The deployment path is deliberately strict: Thunderbolt
+RDMA and MLX's JACCL backend are mandatory; the production runner refuses a TCP
+ring fallback.
+
+The preferred checkpoint is
+[kernelpool/Kimi-K3-2bit-UVMAX](https://huggingface.co/kernelpool/Kimi-K3-2bit-UVMAX),
+a 816.77 GB mixed-precision MLX build whose 2.72T routed-expert parameters are
+2-bit. It keeps the quality-sensitive attention, shared experts, routers, and
+embeddings at 4–8 bits while fitting as two rank-local tensor-parallel
+checkpoints. The original
+883 GB uniform 2-bit streaming conversion remains supported as the fully
+reproducible build path.
+
+Current distributed work, exact storage, cabling, and commands are documented
+in [docs/DISTRIBUTED.md](docs/DISTRIBUTED.md). Benchmark submissions must follow
+[docs/BENCHMARKING.md](docs/BENCHMARKING.md), and contributions follow
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
+The canonical two-host proof at commit `4f8564c` completed all nine paired
+JACCL/RDMA records with identical rank outputs: median decode **3.632 tok/s**
+(range 3.436–3.649), median prefill **47.911 tok/s**, and **414.302 GB** peak
+memory. The complete machine-readable records are in
+[`benchmarks/results/4f8564c-tp-canonical-20260729T211125Z`](benchmarks/results/4f8564c-tp-canonical-20260729T211125Z).
+
+For throughput-oriented serving, the persistent micro-batched JACCL service
+scales to **24.273 tok/s median end-to-end aggregate** and **39.951 tok/s median
+decode-only aggregate** at concurrency 32 (three 64-token repetitions, exact
+cross-rank output proof, no errors). See the raw records in
+[`benchmarks/results/b7c115b-resident-batch-20260807T063408Z`](benchmarks/results/b7c115b-resident-batch-20260807T063408Z).
 
 MLX (Apple Silicon) port of [**moonshotai/Kimi-K3**](https://huggingface.co/moonshotai/Kimi-K3) —
 Moonshot's 2.78T-total / 104B-active native-multimodal MoE, built on Kimi Delta
@@ -10,9 +43,10 @@ the mlx-vlm wrapper that joins them.
 `scripts/convert.py` is a streaming converter — `mlx_lm convert` cannot be used
 here, because it materialises the whole model and K3 is 5.6 TB in bf16.
 
-> **Read this before planning a deployment.** Nothing in this repo runs on a
-> single Mac. The smallest tier is ~870 GB against a 512 GB ceiling on the
-> largest Apple Silicon machine that exists. See [Reality check](#reality-check).
+> **Read this before planning a deployment.** The unpruned model does not fit
+> one Mac. This fork partitions it across two 512 GiB M3 Ultras; the upstream
+> pruned checkpoints remain the right choice for single-machine inference. See
+> [Reality check](#reality-check).
 
 ## Architecture
 
@@ -57,14 +91,13 @@ below is new, and each is marked `[K3-n]` in `kimi_k3.py`:
    threaded through every layer and applied once more at the model output.
 3. **LatentMoE** — experts operate in 3584 dims; shared experts do not.
 4. **q-LoRA + output-gated MLA** — Kimi-Linear had a plain `q_proj` and no gate.
-5. **Per-channel KDA decay.** The reference `modeling_kimi_linear.py` allocates
-   `A_log` as `[num_heads]` = `[96]`, but **every shard ships `[128]` = `head_dim`**,
-   while `b_proj` is `[96, H]` and `dt_bias` is `[12288]`. fla's kernel broadcasts
-   `A_log` against `g` of shape `(B,T,96,128)`, so a length-128 vector can only
-   align with the trailing axis: the decay is per-channel and shared across
-   heads. The reference init code is stale w.r.t. the released weights — the
-   shapes are authoritative. Assuming the Kimi-Linear layout here produces
-   silent garbage, so `tests/test_kimi_k3.py` asserts it.
+5. **Per-head KDA decay with padded storage.** The checkpoint stores `A_log` as
+   `[128]`, but the last 32 values are zero padding after the model's 96 heads.
+   Moonshot's fla kernel indexes one value per head and broadcasts it across the
+   128 channels. It also implements the configured safe lower bound as a sigmoid
+   formula, not a clamp on the ordinary softplus gate. PipeNetwork's CUDA parity
+   harness found both issues and raised KDA-layer cosine from 0.92–0.95 to
+   0.99999; `tests/test_kimi_k3.py` now pins that exact behavior.
 
 ### Vision tower
 
@@ -242,18 +275,22 @@ Two things the numbers say that the earlier text got backwards:
 
 ## Reality check
 
-**No *unpruned* tier is runnable on any Apple Silicon machine.** Peak unified
-memory tops out at 512 GB (M3 Ultra Mac Studio); the smallest full tier here is
-883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
-[REAP pruning](#reap-expert-pruning) exists to solve — the pruned builds in
-[Published](#published) do fit, and do run.
+**No unpruned tier is runnable on one Apple Silicon machine.** Peak unified
+memory tops out at 512 GB (M3 Ultra Mac Studio); the original smallest full tier
+is 883 GB. Fitting 4-bit into 512 GB would need ≤1.38 bits/weight. That is what
+[REAP pruning](#reap-expert-pruning) exists to solve for one Mac. This fork's
+second route is a two-machine JACCL tensor-parallel deployment. Each host keeps
+one half of every sharded matrix, so the 816.77 GB UVMAX checkpoint becomes
+383.335683 GiB per rank. A serial 47/46-layer pipeline remains as a
+correctness/debugging baseline, not the performance deployment.
 
 Consequences, stated plainly:
 
-- The **unpruned tiers** have never produced a token. No perplexity, no
-  generation, no smoke test — that is not a shortcut taken, it is arithmetically
-  impossible on this hardware. Every measured number in this file comes from a
-  REAP-pruned build.
+- In the original single-node work, the **unpruned tiers** had never produced a
+  token because they cannot fit one M3 Ultra. Do not reinterpret the upstream
+  single-node benchmark table as a distributed result. Two-node results in this
+  fork are recorded separately under `work/benchmarks/` and only promoted to
+  this README after a reproducible JACCL run.
 - What *is* verified for them: bit-exactness of the mxfp4 tier against the
   source, 100% checkpoint-key coverage over all 497,220 tensors, prefill/decode
   agreement of the architecture at small scale, and per-expert cosine similarity
@@ -268,7 +305,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers kimi_k3.py, runs all 76 tests
+scripts/test_all.sh                     # 122 unit tests + 2 executable parity checks
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -277,12 +314,15 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | suite | what it covers | |
 |---|---|---|
 | `test_prune_apply.py` | REAP plan application + router renumbering | 18 |
-| `test_kimi_k3.py` | architecture + 497,220-key coverage | 17 |
+| `test_kimi_k3.py` | architecture + 497,220-key coverage | 19 |
 | `test_vl_wrapper.py` | placeholder expansion + multimodal path | 11 |
 | `test_reap.py` | saliency accumulation and planning modes | 10 |
 | `test_vision_parity.py` | vision tower vs torch reference | 9 |
 | `test_processor_integration.py` | real processor -> MLX tower | 7 |
-| `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 4 |
+| `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
+| `test_uvmax.py` | loader, stage integrity, benchmark/RDMA proof, pipeline split | 8 |
+| `test_tensor_stage.py` | offline TP conversion, index, strict rank-local load | 1 |
+| `test_tensor_server.py` | persistent control protocol, parity digest, HTTP batching | 6 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -604,13 +644,66 @@ print("registered kimi_k3 ->", dst)
 PY
 ```
 
+For the unpruned two-node deployment, use the pinned environment and rank-local
+checkpoint builder instead:
+
+```bash
+uv sync --frozen
+scripts/install_model.sh .venv/bin/python
+
+# Beast1 is rank 0; download rank 1 on Beast2 in parallel.
+.venv/bin/python scripts/prepare_uvmax_stage.py --rank 0 --verify-sha256
+ssh beast2.local 'cd ~/dev/kimi-k3-mlx-distributed && \
+  .venv/bin/python scripts/prepare_uvmax_stage.py --rank 1 --verify-sha256'
+
+# After connecting Thunderbolt 5 and confirming RDMA is active:
+scripts/configure_jaccl.sh
+scripts/run_tensor_conversion.sh
+scripts/run_tensor.sh --prompt 'Who is Albert Einstein?' --max-tokens 256
+```
+
+`scripts/tensor_generate.py` initializes `backend="jaccl"` in strict mode and
+requires exactly two ranks. All attention and FFN shards execute concurrently,
+with their MLX tensor-parallel reductions carried by JACCL over Thunderbolt
+RDMA. A missing RDMA/JACCL fabric is an error, not a performance-degrading
+fallback. `scripts/distributed_generate.py` retains the separately proven
+point-to-point pipeline for diagnosis and regression testing.
+
+For regular use, keep one model/JACCL context resident. This avoids the costly
+reload and the JACCL protection-domain exhaustion associated with repeated
+initialisation, while continuous micro-batching recovers throughput from this
+dispatch-bound model:
+
+```bash
+scripts/configure_jaccl.sh
+scripts/run_tensor_server.sh --decode-concurrency 32 --prompt-concurrency 4
+
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"Kimi-K3-2bit-UVMAX","messages":[{"role":"user","content":"Who is Albert Einstein?"}],"max_tokens":256}'
+
+# Measure aggregate throughput without reloading the resident model.
+.venv/bin/python scripts/benchmark_server.py --concurrencies 1,2,4,8,16,32
+
+# When the resident model is no longer needed:
+scripts/stop_tensor_server.sh
+```
+
+The HTTP endpoint runs on Beast1. Each micro-batch is forwarded to Beast2 over
+a small control socket, but every model collective is still strict JACCL over
+Thunderbolt RDMA. Beast1 checks a SHA-256 digest of rank-local token outputs
+before returning the OpenAI-compatible, non-streaming response. `/health` shows
+resident-service and queue state. Bind remains loopback-only by default; use an
+SSH tunnel for remote access rather than exposing the unauthenticated endpoint.
+
 ## Status
 
 - [x] text architecture port (`kimi_k3.py`)
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 76/76 tests passing
+- [x] 122 unit tests discovered: 115 passing, 7 hardware/reference-data skips;
+      both executable pipeline parity checks pass
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
@@ -618,6 +711,13 @@ PY
 - [x] publish to `pipenetwork/` (4 tiers)
 - [x] **held-out perplexity** (`scripts/perplexity.py`), bucketed per source
 - [x] AWQ implemented and measured — [small, fragile, domain-skewed](#awq-on-the-2-bit-experts--measured)
+- [x] latest stable MLX 0.32.0 + mlx-lm 0.31.3 environment pinned by `uv.lock`
+- [x] resumable 47/46-layer rank-local UVMAX downloader (about 384.5 GiB/rank)
+- [x] exact two-rank prefill and cached-decode parity on a miniature K3
+- [x] exact 64-token/32-step tensor parity over real two-host JACCL/RDMA
+- [x] production runner hard-requires JACCL and two ranks
+- [x] full tensor-parallel two-M3-Ultra JACCL generation and canonical benchmark
+- [x] persistent OpenAI-compatible serving with deterministic micro-batching and cross-rank output proof
 - [ ] AWQ re-run on a balanced calibration corpus (in progress)
 - [ ] tok/s re-measured for all published tiers after the wiring fix
 
@@ -634,3 +734,12 @@ carry the upstream licence too; `scripts/convert.py` copies it into every tier.
 
 Everything outside `reference/` — `kimi_k3.py`, `kimi_k3_vision.py`,
 `kimi_k3_vl/`, `scripts/`, `tests/` — is this port.
+
+Distributed additions in this fork retain and credit that work. The UVMAX
+loader is based on Tarjei Mandt's
+[mlx-lm PR #1626](https://github.com/ml-explore/mlx-lm/pull/1626), pinned to
+commit `7d505c285b801108a52c23353c7fb6af07204717` and kept under mlx-lm's MIT
+terms. The UVMAX weights remain under Moonshot's Kimi K3 license. See
+[NOTICE.md](NOTICE.md) for the file-by-file provenance and licensing caveat:
+the fork point did not include a top-level software license, so inherited code
+cannot be retroactively relicensed by this fork.
