@@ -242,7 +242,10 @@ class TestConverterRoundTrip(unittest.TestCase):
     def _convert(self, profile):
         out = os.path.join(self.tmp, profile)
         r = subprocess.run(
-            [sys.executable, CONVERT, "--src", self.src, "--out", out, "--profile", profile],
+            # --overwrite: several tests convert the same profile into the same
+            # path, and the converter now refuses to write over a build unasked.
+            [sys.executable, CONVERT, "--src", self.src, "--out", out,
+             "--profile", profile, "--overwrite"],
             capture_output=True, text=True,
         )
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

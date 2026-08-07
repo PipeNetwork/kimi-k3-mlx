@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from mlx_lm.models import kimi_k3_uvmax
+from mlx_lm.models import kimi_k3
 from scripts.distributed_generate import (
     benchmark_cases,
     load_manifest,
@@ -77,6 +78,24 @@ class FakeGroup:
 
 
 class TestUvmaxStage(unittest.TestCase):
+    def test_uvmax_gate_matches_upstream_corrected_formula(self):
+        """The live TP loader must retain PipeNetwork's fla parity correction."""
+        args = kimi_k3.ModelArgs.from_dict(tiny_config(num_layers=4))
+        attention = kimi_k3.KimiDeltaAttention(args, 0)
+        attention.A_log = mx.linspace(-0.4, 0.8, attention.head_dim)
+        attention.dt_bias = mx.linspace(-1.0, 1.0, attention.projection_dim)
+        activations = mx.random.normal(
+            (2, 3, attention.num_heads, attention.head_dim)
+        )
+        got = attention._compute_g(activations)
+        expected = kimi_k3_uvmax._compute_g_safe(
+            attention.A_log[: attention.num_heads].reshape(attention.num_heads, 1),
+            activations,
+            attention.dt_bias.reshape(attention.num_heads, attention.head_dim),
+            attention.gate_lower_bound,
+        )
+        self.assertLess(float(mx.max(mx.abs(got - expected))), 1e-7)
+
     def test_runner_requires_sha256_verified_stage(self):
         with tempfile.TemporaryDirectory() as tmp:
             stage = Path(tmp)

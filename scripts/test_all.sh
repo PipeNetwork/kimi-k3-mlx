@@ -20,7 +20,11 @@ scripts/install_model.sh "$PY" >/dev/null
 fail=0
 for t in tests/test_*.py; do
   printf "%-34s " "$(basename "$t")"
-  raw=$("$PY" -W ignore "$t" 2>&1); rc=$?
+  # Directly executing tests/test_*.py puts tests/ rather than the repository
+  # root at sys.path[0]. Keep the project root importable so tests can exercise
+  # the real scripts package consistently from a clean shell.
+  raw=$(PYTHONPATH="${PYTHONPATH:+$PYTHONPATH:}$PWD" \
+      "$PY" -W ignore "$t" 2>&1); rc=$?
   # unittest prints Ran/OK/FAILED. Suites that are plain scripts rather than
   # unittest (the mlx.launch pipeline checks) report a shouted verdict line such
   # as "PIPELINE PARITY OK" or "PARAM-KEY CHECK OK"; match that shape generally

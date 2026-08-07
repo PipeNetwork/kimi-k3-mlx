@@ -91,14 +91,13 @@ below is new, and each is marked `[K3-n]` in `kimi_k3.py`:
    threaded through every layer and applied once more at the model output.
 3. **LatentMoE** — experts operate in 3584 dims; shared experts do not.
 4. **q-LoRA + output-gated MLA** — Kimi-Linear had a plain `q_proj` and no gate.
-5. **Per-channel KDA decay.** The reference `modeling_kimi_linear.py` allocates
-   `A_log` as `[num_heads]` = `[96]`, but **every shard ships `[128]` = `head_dim`**,
-   while `b_proj` is `[96, H]` and `dt_bias` is `[12288]`. fla's kernel broadcasts
-   `A_log` against `g` of shape `(B,T,96,128)`, so a length-128 vector can only
-   align with the trailing axis: the decay is per-channel and shared across
-   heads. The reference init code is stale w.r.t. the released weights — the
-   shapes are authoritative. Assuming the Kimi-Linear layout here produces
-   silent garbage, so `tests/test_kimi_k3.py` asserts it.
+5. **Per-head KDA decay with padded storage.** The checkpoint stores `A_log` as
+   `[128]`, but the last 32 values are zero padding after the model's 96 heads.
+   Moonshot's fla kernel indexes one value per head and broadcasts it across the
+   128 channels. It also implements the configured safe lower bound as a sigmoid
+   formula, not a clamp on the ordinary softplus gate. PipeNetwork's CUDA parity
+   harness found both issues and raised KDA-layer cosine from 0.92–0.95 to
+   0.99999; `tests/test_kimi_k3.py` now pins that exact behavior.
 
 ### Vision tower
 
@@ -306,7 +305,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers both loaders, runs all 107 tests
+scripts/test_all.sh                     # 122 unit tests + 2 executable parity checks
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -703,7 +702,8 @@ SSH tunnel for remote access rather than exposing the unauthenticated endpoint.
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 107 tests discovered: 100 passing, 7 hardware/reference-data skips
+- [x] 122 unit tests discovered: 115 passing, 7 hardware/reference-data skips;
+      both executable pipeline parity checks pass
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,

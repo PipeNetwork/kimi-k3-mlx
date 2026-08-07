@@ -51,10 +51,12 @@ claims require the JACCL/RDMA profile in `docs/BENCHMARKING.md`.
   silent fallback.
 
 By submitting a contribution, you certify that you have the right to submit it
-and agree that your new contribution may be distributed under the license you
-state in the pull request. Inherited files keep their existing terms; see
-`NOTICE.md`. Until the original project's top-level software license is
-clarified, do not describe the entire combined work as MIT-licensed.
+and agree that your original, separable contribution may be distributed under
+the MIT License in `LICENSES/Fork-Additions-MIT.txt`, unless you state another
+compatible license in the pull request and the maintainers accept it. Inherited
+files keep their existing terms; see `LICENSE` and `NOTICE.md`. Until the
+original project's top-level software license is clarified, do not describe the
+entire combined work as MIT-licensed.
 
 Be direct and respectful in technical discussion. Maintainers may close work
 that cannot be reproduced, removes attribution, includes secrets/weights, or

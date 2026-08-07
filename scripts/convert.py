@@ -7,6 +7,8 @@ at a time and never holds more than a few tens of GB.
 
 Profiles
 --------
+  bf16    experts widened from source MXFP4 to dense bf16; everything else copied.
+          This is a 5.33 TB reference artifact, not a higher-fidelity model.
   mxfp4   experts copied BYTE-FOR-BYTE from the source (lossless); rest bf16
   3bit    experts affine 3-bit g64; rest 4-bit; router gate 8-bit
   2bit    experts affine 2-bit g64; rest 4-bit; router gate 8-bit
@@ -41,6 +43,7 @@ from mlx_lm.models import kimi_k3  # noqa: E402
 
 FP4_GROUP = 32
 SHARD_BYTES = 5 * 1024**3
+PROGRESS = "_progress.json"
 
 # Copied verbatim from the source repo into every output.
 PASSTHROUGH_FILES = [
@@ -76,6 +79,10 @@ def atomic_json(path: str, value: Dict):
 
 
 def profile_spec(profile: str, nonexpert_bits: Optional[int] = None) -> Dict[str, object]:
+    if profile == "bf16":
+        # Source experts contain four bits of information. Widening them is useful
+        # as an unquantized reference/requantization artifact, not as quality gain.
+        return dict(expert=None, other=None, gate=None, global_q=None)
     if profile == "mxfp4":
         # Non-experts default to bf16 (114 GB on K3 -- 2% of params but 23% of a
         # REAP'd build's footprint). --nonexpert-bits trades that down; they were
@@ -271,6 +278,61 @@ class ShardWriter:
             raise RuntimeError("flush before recording ShardWriter state")
         return {"shards": self.shards, "total": self.total}
 
+    def _existing(self) -> List[str]:
+        return [
+            name
+            for name in os.listdir(self.out)
+            if name.startswith("model-") and name.endswith(".safetensors")
+        ]
+
+    def guard_fresh(self, overwrite: bool = False) -> None:
+        """Compatibility guard for whole-checkpoint conversion callers."""
+        stale = self._existing()
+        if not stale:
+            return
+        if not overwrite:
+            raise SystemExit(
+                f"{self.out} already contains {len(stale)} model shard(s)"
+            )
+        for name in stale:
+            os.remove(os.path.join(self.out, name))
+        for name in ("model.safetensors.index.json", PROGRESS):
+            path = os.path.join(self.out, name)
+            if os.path.isfile(path):
+                os.remove(path)
+
+    def checkpoint(self, state: Dict) -> None:
+        """Atomically journal the generic writer state for legacy/full builds."""
+        self.flush()
+        atomic_json(
+            os.path.join(self.out, PROGRESS),
+            {
+                **state,
+                "shards": self.shards,
+                "weight_map": self.weight_map,
+                "total": self.total,
+            },
+        )
+
+    def resume_from(self) -> Optional[Dict]:
+        path = os.path.join(self.out, PROGRESS)
+        if not os.path.isfile(path):
+            if self._existing():
+                raise SystemExit(
+                    f"{self.out} has model shards but no {PROGRESS} journal"
+                )
+            return None
+        with open(path) as source:
+            state = json.load(source)
+        self.shards = [(name, keys) for name, keys in state["shards"]]
+        self.weight_map = dict(state["weight_map"])
+        self.total = int(state["total"])
+        known = {name for name, _keys in self.shards}
+        for name in self._existing():
+            if name not in known:
+                os.remove(os.path.join(self.out, name))
+        return state
+
     def finalize(self, conventional_names: bool = True):
         self.flush()
         n = len(self.shards)
@@ -292,6 +354,9 @@ class ShardWriter:
                 indent=2,
             )
         os.replace(index_partial, index_path)
+        progress = os.path.join(self.out, PROGRESS)
+        if os.path.isfile(progress):
+            os.remove(progress)
 
 
 # ------------------------------------------------------------- quantization
@@ -336,6 +401,61 @@ def expert_stack_passthrough(
     out = {"weight": mx.stack(packed), "scales": mx.stack(scales)}
     mx.eval(out["weight"], out["scales"])
     return out
+
+
+def expert_stack_dense(
+    reader: ShardReader, layer: int, w: str, n_experts, keep=None
+) -> Dict[str, mx.array]:
+    """Widen source MXFP4 experts to dense bf16 with bounded peak memory."""
+    base = f"language_model.model.layers.{layer}.block_sparse_moe.experts"
+    order = keep if keep is not None else range(n_experts)
+    dense_experts = []
+    for expert in order:
+        packed = reader.get(f"{base}.{expert}.{w}.weight_packed").view(mx.uint32)
+        scale = reader.get(f"{base}.{expert}.{w}.weight_scale")
+        dense = mx.dequantize(
+            packed, scale, group_size=FP4_GROUP, bits=4, mode="mxfp4"
+        ).astype(mx.bfloat16)
+        mx.eval(dense)
+        dense_experts.append(dense)
+        del packed, scale
+    result = {"weight": mx.stack(dense_experts)}
+    mx.eval(result["weight"])
+    return result
+
+
+def prepare_output(out: str, *, resume: bool, overwrite: bool) -> None:
+    """Refuse interleaved builds; explicitly clear converter artifacts on overwrite."""
+    if resume and overwrite:
+        raise SystemExit(
+            "--resume continues a build and --overwrite replaces it; pass only one"
+        )
+    if not os.path.isdir(out):
+        return
+    artifacts = [
+        name
+        for name in os.listdir(out)
+        if (
+            (name.startswith("model-") and ".safetensors" in name)
+            or name
+            in {
+                "model.safetensors.index.json",
+                "conversion_state.json",
+                "config.json.partial",
+            }
+        )
+    ]
+    if resume or not artifacts:
+        return
+    if not overwrite:
+        raise SystemExit(
+            f"{out} already contains {len(artifacts)} conversion artifact(s); "
+            "pass --overwrite to replace it or --resume to continue it"
+        )
+    for name in artifacts:
+        path = os.path.join(out, name)
+        if os.path.isfile(path):
+            os.remove(path)
 
 
 def expert_stack_requant(
@@ -451,10 +571,12 @@ def convert(
     hf_repo: Optional[str] = None,
     evict_source_shards: bool = False,
     resume: bool = False,
+    overwrite: bool = False,
     stage_rank: Optional[int] = None,
     stage_size: Optional[int] = None,
     max_layers_this_run: Optional[int] = None,
 ):
+    prepare_output(out, resume=resume, overwrite=overwrite)
     if hf_repo:
         prepare_hf_source(hf_repo, src)
     spec = profile_spec(profile, nonexpert_bits)
@@ -669,13 +791,17 @@ def convert(
             for w, dst in (("w1", "gate_proj"), ("w3", "up_proj"), ("w2", "down_proj")):
                 es = spec["expert"]
                 if bank is None:
-                    if es["mode"] == "mxfp4":
+                    if es is None:
+                        t = expert_stack_dense(
+                            reader, i, w, args.num_experts, keep
+                        )
+                    elif es["mode"] == "mxfp4":
                         t = expert_stack_passthrough(reader, i, w, args.num_experts, keep)
                     else:
                         t = expert_stack_requant(reader, i, w, args.num_experts, es,
                                                  keep, awq[i] if awq is not None else None)
                     emit(f"{moe}.{dst}", t)
-                    if es != spec["global_q"]:
+                    if es is not None and es != spec["global_q"]:
                         overrides[f"{moe}.{dst}"] = dict(es)
                     del t
                 else:
@@ -767,9 +893,16 @@ def convert(
     if "text_config" in cfg:
         cfg["text_config"] = dict(cfg["text_config"])
         cfg["text_config"].pop("quantization_config", None)
-    q = dict(spec["global_q"])
-    q.update(overrides)
-    cfg["quantization"] = q
+    if spec["global_q"] is None:
+        cfg.pop("quantization", None)
+        if overrides:
+            raise SystemExit(
+                f"bf16 profile unexpectedly produced quantization overrides: {list(overrides)}"
+            )
+    else:
+        q = dict(spec["global_q"])
+        q.update(overrides)
+        cfg["quantization"] = q
     if stage_rank is not None:
         cfg["distributed_pipeline"] = {
             "backend": "jaccl",
@@ -829,7 +962,7 @@ if __name__ == "__main__":
     ap.add_argument("--src", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--profile", required=True,
-                    choices=["mxfp4", "3bit", "2bit", "mixed2"])
+                    choices=["bf16", "mxfp4", "3bit", "2bit", "mixed2"])
     ap.add_argument("--limit-layers", type=int, default=None,
                     help="convert only the first N layers (smoke testing)")
     ap.add_argument("--layer-start", type=int, default=0,
@@ -846,6 +979,8 @@ if __name__ == "__main__":
                     help="delete on-demand source shards after their LRU eviction")
     ap.add_argument("--resume", action="store_true",
                     help="journal each completed layer and resume safely")
+    ap.add_argument("--overwrite", action="store_true",
+                    help="replace converter artifacts already present at --out")
     ap.add_argument("--max-layers-this-run", type=int,
                     help=argparse.SUPPRESS)
     ap.add_argument("--nonexpert-bits", type=int, default=None,
@@ -871,6 +1006,7 @@ if __name__ == "__main__":
         hf_repo=a.hf_repo,
         evict_source_shards=a.evict_source_shards,
         resume=a.resume,
+        overwrite=a.overwrite,
         stage_rank=a.stage_rank,
         stage_size=a.stage_size,
         max_layers_this_run=a.max_layers_this_run,

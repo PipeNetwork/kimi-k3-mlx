@@ -42,7 +42,12 @@ results derived from it.
 
 ## Fork additions
 
-New distributed scripts, tests, and documentation first authored in
-`michalkomar/kimi-k3-mlx-distributed` should carry explicit license terms when
-published. Adding a project-wide OSS license requires coordination with the
-original author because a fork cannot relicense the inherited body on its own.
+Copyright (c) 2026 Michal Komar and contributors. Original, separable
+distributed scripts, tests, benchmark tooling, and documentation first authored
+in `michalkomar/kimi-k3-mlx-distributed` are offered under the MIT License in
+`LICENSES/Fork-Additions-MIT.txt`. That grant covers only copyright held by
+those contributors and does not relicense inherited or third-party material.
+
+The root `LICENSE` file is a scope manifest, not a claim that the combined work
+has one project-wide license. A conventional project-wide OSS license still
+requires the original author to license the inherited body.
