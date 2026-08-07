@@ -47,7 +47,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--port", type=int, default=8080)
     parser.add_argument("--decode-concurrency", type=int, default=8)
     parser.add_argument("--prompt-concurrency", type=int, default=4)
-    parser.add_argument("--batch-window-ms", type=float, default=20.0)
+    parser.add_argument("--batch-window-ms", type=float, default=100.0)
     parser.add_argument("--max-request-tokens", type=int, default=4096)
     parser.add_argument("--raw-prompt", action="store_true")
     parser.add_argument(
@@ -514,6 +514,12 @@ def make_handler(engine: InferenceEngine, tokenizer, args: argparse.Namespace):
     return Handler
 
 
+class InferenceHTTPServer(ThreadingHTTPServer):
+    # socketserver.TCPServer defaults to five, which fragments larger batches
+    # before the application-level coalescing window can see them.
+    request_queue_size = 128
+
+
 def main() -> int:
     args = parse_args()
     if args.decode_concurrency < 1 or args.prompt_concurrency < 1:
@@ -556,7 +562,9 @@ def main() -> int:
             channel.close()
 
     engine = InferenceEngine(model, tokenizer, channel, args)
-    server = ThreadingHTTPServer((args.bind, args.port), make_handler(engine, tokenizer, args))
+    server = InferenceHTTPServer(
+        (args.bind, args.port), make_handler(engine, tokenizer, args)
+    )
     server.daemon_threads = True
     run_id = os.environ.get("KIMI_RUN_ID", "server")
     ready_dir = Path("work/server") / run_id

@@ -300,7 +300,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers both loaders, runs all 106 tests
+scripts/test_all.sh                     # registers both loaders, runs all 107 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -317,7 +317,7 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
 | `test_uvmax.py` | loader, stage integrity, benchmark/RDMA proof, pipeline split | 8 |
 | `test_tensor_stage.py` | offline TP conversion, index, strict rank-local load | 1 |
-| `test_tensor_server.py` | persistent control protocol, parity digest, fixture tokenizer | 5 |
+| `test_tensor_server.py` | persistent control protocol, parity digest, HTTP batching | 6 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -694,7 +694,7 @@ SSH tunnel for remote access rather than exposing the unauthenticated endpoint.
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 106 tests discovered: 99 passing, 7 hardware/reference-data skips
+- [x] 107 tests discovered: 100 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,

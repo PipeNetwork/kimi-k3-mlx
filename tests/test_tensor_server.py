@@ -5,6 +5,7 @@ import unittest
 
 from scripts.tensor_server import (
     FixtureTokenizer,
+    InferenceHTTPServer,
     JsonChannel,
     output_digest,
     parse_endpoint,
@@ -48,6 +49,9 @@ class TestTensorServer(unittest.TestCase):
         self.assertEqual(parse_concurrencies("1,4,16"), [1, 4, 16])
         with self.assertRaises(argparse.ArgumentTypeError):
             parse_concurrencies("1,1")
+
+    def test_http_backlog_covers_max_batch(self):
+        self.assertGreaterEqual(InferenceHTTPServer.request_queue_size, 32)
 
 
 if __name__ == "__main__":

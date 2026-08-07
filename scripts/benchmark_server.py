@@ -32,6 +32,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--prompt", default="Explain why the sky appears blue in two sentences.")
     parser.add_argument("--output", type=Path)
+    parser.add_argument(
+        "--allow-split-batches",
+        action="store_true",
+        help="Record fragmented server batches instead of treating them as invalid.",
+    )
     return parser.parse_args()
 
 
@@ -69,6 +74,11 @@ def run_trial(args: argparse.Namespace, concurrency: int, trial: int) -> dict:
     latencies = [item[1] for item in responses]
     completion_tokens = sum(item["usage"]["completion_tokens"] for item in values)
     distributed = [item["distributed"] for item in values]
+    batch_sizes = sorted({item["batch_size"] for item in distributed})
+    if not args.allow_split_batches and batch_sizes != [concurrency]:
+        raise RuntimeError(
+            f"concurrency {concurrency} fragmented into batch sizes {batch_sizes}"
+        )
     return {
         "concurrency": concurrency,
         "trial": trial,
@@ -80,7 +90,7 @@ def run_trial(args: argparse.Namespace, concurrency: int, trial: int) -> dict:
             "min": min(latencies),
             "max": max(latencies),
         },
-        "server_batch_sizes": sorted({item["batch_size"] for item in distributed}),
+        "server_batch_sizes": batch_sizes,
         "server_batch_generation_tps": sorted(
             {item["batch_generation_tps"] for item in distributed}
         ),
