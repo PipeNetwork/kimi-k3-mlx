@@ -1,0 +1,43 @@
+{
+  "backend": "jaccl",
+  "checkpoint": {
+    "repository": "kernelpool/Kimi-K3-2bit-UVMAX",
+    "revision": "edb5113218df612f4a92f95145680f3f8eacd375",
+    "stage_gib_per_rank": 383.3356832517311,
+    "world_size": 2
+  },
+  "code_commit": "b7c115bb31b4f9e9f0949c0ba6e35c5527a8a075",
+  "concurrency_32": {
+    "decode_only_aggregate_tps": {
+      "max": 40.30317582151234,
+      "median": 39.95135360080685,
+      "min": 39.14631414617635
+    },
+    "end_to_end_aggregate_tps": {
+      "max": 25.172663863057142,
+      "median": 24.273364173731455,
+      "min": 22.271593468701006
+    },
+    "parity_sha256": "9545a7ccc2b7ea89fbb44f491548cdd16b8f75a63a3ca9bee86aae004a751e54",
+    "repetitions": 3
+  },
+  "decode_concurrency": 32,
+  "errors": 0,
+  "hostfile_sha256": "81be04f169485a14247164b25fc0b130513bbefbe03c153c0c2cb63320a9c236",
+  "mlx_metal_fast_synch": "1",
+  "prompt_concurrency": 4,
+  "rdma_devices": ["rdma_en3", "rdma_en3"],
+  "run_id": "kimi-server-20260807T063408Z",
+  "schema": 1,
+  "service_after_proof": {
+    "batches": 9,
+    "generated_tokens": 8144,
+    "ready": true,
+    "requests": 128
+  },
+  "transport": "thunderbolt-rdma",
+  "versions": {
+    "mlx": "0.32.0",
+    "mlx_lm": "0.31.3"
+  }
+}

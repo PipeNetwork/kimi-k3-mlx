@@ -27,6 +27,12 @@ JACCL/RDMA records with identical rank outputs: median decode **3.632 tok/s**
 memory. The complete machine-readable records are in
 [`benchmarks/results/4f8564c-tp-canonical-20260729T211125Z`](benchmarks/results/4f8564c-tp-canonical-20260729T211125Z).
 
+For throughput-oriented serving, the persistent micro-batched JACCL service
+scales to **24.273 tok/s median end-to-end aggregate** and **39.951 tok/s median
+decode-only aggregate** at concurrency 32 (three 64-token repetitions, exact
+cross-rank output proof, no errors). See the raw records in
+[`benchmarks/results/b7c115b-resident-batch-20260807T063408Z`](benchmarks/results/b7c115b-resident-batch-20260807T063408Z).
+
 MLX (Apple Silicon) port of [**moonshotai/Kimi-K3**](https://huggingface.co/moonshotai/Kimi-K3) —
 Moonshot's 2.78T-total / 104B-active native-multimodal MoE, built on Kimi Delta
 Attention (KDA) and Attention Residuals (AttnRes), with a 1M-token context.
@@ -679,6 +685,9 @@ curl http://127.0.0.1:8080/v1/chat/completions \
 
 # Measure aggregate throughput without reloading the resident model.
 .venv/bin/python scripts/benchmark_server.py --concurrencies 1,2,4,8,16,32
+
+# When the resident model is no longer needed:
+scripts/stop_tensor_server.sh
 ```
 
 The HTTP endpoint runs on Beast1. Each micro-batch is forwarded to Beast2 over

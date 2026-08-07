@@ -1,0 +1,57 @@
+{
+  "backend": "jaccl",
+  "command": [
+    "/usr/bin/caffeinate",
+    "-dimsu",
+    "/Users/agent/dev/kimi-k3-mlx-distributed/.venv/bin/python",
+    "scripts/tensor_server.py",
+    "--model-root",
+    "weights/Kimi-K3-2bit-UVMAX-tensor-2",
+    "--port",
+    "8080",
+    "--decode-concurrency",
+    "32",
+    "--prompt-concurrency",
+    "4"
+  ],
+  "control_coordinator": "10.209.226.38:32324",
+  "coordinator": "10.209.226.38:32323",
+  "created_at": "2026-08-07T06:34:17.494242+00:00",
+  "devices": [
+    [
+      null,
+      "rdma_en3"
+    ],
+    [
+      "rdma_en3",
+      null
+    ]
+  ],
+  "hostfile": "/Users/agent/dev/kimi-k3-mlx-distributed/hosts-jaccl.json",
+  "hostfile_sha256": "81be04f169485a14247164b25fc0b130513bbefbe03c153c0c2cb63320a9c236",
+  "jaccl_ring": false,
+  "python": "/opt/homebrew/Cellar/python@3.13/3.13.15/Frameworks/Python.framework/Versions/3.13/bin/python3.13",
+  "ranks": [
+    {
+      "exit": "/Users/agent/dev/kimi-k3-mlx-distributed/work/runs/kimi-server-20260807T063408Z/rank0.exit",
+      "log": "/Users/agent/dev/kimi-k3-mlx-distributed/work/runs/kimi-server-20260807T063408Z/rank0.log",
+      "pid": 39085,
+      "rank": 0,
+      "screen": "kimi-r0-388104b152bf1c86"
+    },
+    {
+      "exit": "/Users/agent/dev/kimi-k3-mlx-distributed/work/runs/kimi-server-20260807T063408Z/rank1.exit",
+      "log": "/Users/agent/dev/kimi-k3-mlx-distributed/work/runs/kimi-server-20260807T063408Z/rank1.log",
+      "pid": 82337,
+      "rank": 1,
+      "screen": "kimi-r1-388104b152bf1c86"
+    }
+  ],
+  "remote": "10.209.226.197",
+  "remote_repo": "/Users/agent/dev/kimi-k3-mlx-distributed",
+  "repo": "/Users/agent/dev/kimi-k3-mlx-distributed",
+  "run_id": "kimi-server-20260807T063408Z",
+  "schema": 1,
+  "transport": "thunderbolt-rdma"
+}
+

@@ -1,0 +1,60 @@
+{
+  "endpoint": "http://127.0.0.1:8080/v1/chat/completions",
+  "max_tokens": 64,
+  "prompt": "Explain why the sky appears blue in two sentences.",
+  "records": [
+    {
+      "aggregate_generation_tps": 22.271593468701006,
+      "completion_tokens": 2048,
+      "concurrency": 32,
+      "parity_sha256": [
+        "9545a7ccc2b7ea89fbb44f491548cdd16b8f75a63a3ca9bee86aae004a751e54"
+      ],
+      "request_latency_seconds": {
+        "max": 91.9489740000572,
+        "median": 91.94702975003747,
+        "min": 91.94447466707788
+      },
+      "server_batch_generation_tps": [
+        39.95135360080685
+      ],
+      "server_batch_sizes": [
+        32
+      ],
+      "trial": 1,
+      "wall_seconds": 91.95570145791862
+    },
+    {
+      "aggregate_generation_tps": 24.273364173731455,
+      "completion_tokens": 2048,
+      "concurrency": 32,
+      "parity_sha256": [
+        "9545a7ccc2b7ea89fbb44f491548cdd16b8f75a63a3ca9bee86aae004a751e54"
+      ],
+      "request_latency_seconds": {
+        "max": 84.369569457951,
+        "median": 84.36785452044569,
+        "min": 84.36603274999652
+      },
+      "server_batch_generation_tps": [
+        39.14631414617635
+      ],
+      "server_batch_sizes": [
+        32
+      ],
+      "trial": 2,
+      "wall_seconds": 84.37231795897242
+    }
+  ],
+  "run_id": "server-benchmark-20260807T064107Z",
+  "schema": 1,
+  "summary": {
+    "32": {
+      "max": 24.273364173731455,
+      "median_aggregate_generation_tps": 23.272478821216232,
+      "min": 22.271593468701006
+    }
+  },
+  "trials": 2
+}
+
