@@ -1,3 +1,4 @@
+import argparse
 import socket
 import threading
 import unittest
@@ -8,6 +9,7 @@ from scripts.tensor_server import (
     output_digest,
     parse_endpoint,
 )
+from scripts.benchmark_server import parse_concurrencies
 
 
 class TestTensorServer(unittest.TestCase):
@@ -41,6 +43,11 @@ class TestTensorServer(unittest.TestCase):
         )
         self.assertTrue(tokens)
         self.assertTrue(all(1 <= token <= 126 for token in tokens))
+
+    def test_benchmark_concurrencies(self):
+        self.assertEqual(parse_concurrencies("1,4,16"), [1, 4, 16])
+        with self.assertRaises(argparse.ArgumentTypeError):
+            parse_concurrencies("1,1")
 
 
 if __name__ == "__main__":
