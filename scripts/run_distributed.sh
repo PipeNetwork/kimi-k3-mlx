@@ -3,12 +3,23 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-REMOTE_HOST="${KIMI_REMOTE_HOST:-beast2.local}"
 HOSTFILE="${KIMI_HOSTFILE:-hosts-jaccl.json}"
 PYTHON="${KIMI_PYTHON:-/Users/agent/dev/kimi-k3-mlx-distributed/.venv/bin/python}"
 REPO_DIR="${KIMI_REPO_DIR:-/Users/agent/dev/kimi-k3-mlx-distributed}"
+REMOTE_HOST="${KIMI_REMOTE_HOST:-}"
+if [[ -z "$REMOTE_HOST" ]]; then
+    REMOTE_HOST="$("$PYTHON" -c \
+        'import json,sys; print(json.load(open(sys.argv[1]))["hosts"][1]["ssh"])' \
+        "$HOSTFILE")"
+fi
 RUN_ID="${KIMI_RUN_ID:-$(date -u +%Y%m%dT%H%M%SZ)}"
 PROGRAM="${KIMI_DISTRIBUTED_PROGRAM:-scripts/distributed_generate.py}"
+COMPLETION="${KIMI_DISTRIBUTED_COMPLETION:-summaries}"
+
+[[ "$COMPLETION" == "summaries" || "$COMPLETION" == "exit" ]] || {
+    echo "KIMI_DISTRIBUTED_COMPLETION must be summaries or exit" >&2
+    exit 2
+}
 
 args=("$@")
 for ((index = 0; index < ${#args[@]}; index++)); do
@@ -50,9 +61,9 @@ release_completed_lock() {
 
 residual_workers() {
     local local_pids remote_pids
-    local_pids="$(pgrep -f '[s]cripts/(distributed_generate|tensor_generate).py' || true)"
+    local_pids="$(pgrep -f '[s]cripts/(distributed_generate|tensor_generate|tensor_server).py' || true)"
     remote_pids="$(ssh -o BatchMode=yes -o ConnectTimeout=5 "$REMOTE_HOST" \
-        "pgrep -f '[s]cripts/(distributed_generate|tensor_generate).py' || true")"
+        "pgrep -f '[s]cripts/(distributed_generate|tensor_generate|tensor_server).py' || true")"
     if [[ -n "$local_pids" || -n "$remote_pids" ]]; then
         echo "Refusing to launch while a distributed generator is still active." >&2
         [[ -z "$local_pids" ]] || echo "Local worker PIDs: $local_pids" >&2
@@ -108,15 +119,17 @@ test -f "$HOSTFILE" || {
 LOCAL_SUMMARY="work/benchmarks/${RUN_ID}-summary-rank0.json"
 REMOTE_SUMMARY="work/benchmarks/${RUN_ID}-summary-rank1.json"
 
-test ! -e "$LOCAL_SUMMARY" || {
-    echo "Refusing to overwrite existing $LOCAL_SUMMARY" >&2
-    exit 2
-}
-ssh -o BatchMode=yes "$REMOTE_HOST" \
-    "test ! -e '$REPO_DIR/$REMOTE_SUMMARY'" || {
-    echo "Refusing to overwrite existing $REMOTE_HOST:$REPO_DIR/$REMOTE_SUMMARY" >&2
-    exit 2
-}
+if [[ "$COMPLETION" == "summaries" ]]; then
+    test ! -e "$LOCAL_SUMMARY" || {
+        echo "Refusing to overwrite existing $LOCAL_SUMMARY" >&2
+        exit 2
+    }
+    ssh -o BatchMode=yes "$REMOTE_HOST" \
+        "test ! -e '$REPO_DIR/$REMOTE_SUMMARY'" || {
+        echo "Refusing to overwrite existing $REMOTE_HOST:$REPO_DIR/$REMOTE_SUMMARY" >&2
+        exit 2
+    }
+fi
 
 scripts/install_model.sh "$PYTHON"
 ssh -o BatchMode=yes "$REMOTE_HOST" \
@@ -143,7 +156,8 @@ mv "$LOCK_OWNER.tmp" "$LOCK_OWNER"
 set +e
 "$PYTHON" scripts/durable_jaccl.py wait \
     --run-id "$RUN_ID" \
-    --repo "$REPO_DIR"
+    --repo "$REPO_DIR" \
+    --completion "$COMPLETION"
 launch_status=$?
 set -e
 
@@ -152,15 +166,17 @@ set -e
     echo "Reattach with: $PYTHON scripts/durable_jaccl.py wait --run-id '$RUN_ID' --repo '$REPO_DIR'" >&2
     exit "$launch_status"
 }
-test -s "$LOCAL_SUMMARY" || {
-    echo "Rank 0 did not produce $LOCAL_SUMMARY; treating launch as failed" >&2
-    exit 1
-}
-ssh -o BatchMode=yes "$REMOTE_HOST" \
-    "test -s '$REPO_DIR/$REMOTE_SUMMARY'" || {
-    echo "Rank 1 did not produce $REMOTE_HOST:$REPO_DIR/$REMOTE_SUMMARY; treating launch as failed" >&2
-    exit 1
-}
+if [[ "$COMPLETION" == "summaries" ]]; then
+    test -s "$LOCAL_SUMMARY" || {
+        echo "Rank 0 did not produce $LOCAL_SUMMARY; treating launch as failed" >&2
+        exit 1
+    }
+    ssh -o BatchMode=yes "$REMOTE_HOST" \
+        "test -s '$REPO_DIR/$REMOTE_SUMMARY'" || {
+        echo "Rank 1 did not produce $REMOTE_HOST:$REPO_DIR/$REMOTE_SUMMARY; treating launch as failed" >&2
+        exit 1
+    }
+fi
 
 release_completed_lock
 echo "Both ranks completed run $RUN_ID successfully."

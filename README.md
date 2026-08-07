@@ -300,7 +300,7 @@ Consequences, stated plainly:
 ## Verification
 
 ```bash
-scripts/test_all.sh                     # registers both loaders, runs all 101 tests
+scripts/test_all.sh                     # registers both loaders, runs all 105 tests
 scripts/verify.py --path out/Kimi-K3-MLX-mxfp4 --src Kimi-K3-src
 scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
     --skip-tokens <past the calibration prefix> --out out/ppl.npz
@@ -317,6 +317,7 @@ scripts/perplexity.py --path out/<tier> --calib-text out/calib.txt \
 | `test_convert_roundtrip.py` | converter + profile distinctness, on a mini-K3 | 5 |
 | `test_uvmax.py` | loader, stage integrity, benchmark/RDMA proof, pipeline split | 8 |
 | `test_tensor_stage.py` | offline TP conversion, index, strict rank-local load | 1 |
+| `test_tensor_server.py` | persistent control protocol, parity digest, fixture tokenizer | 4 |
 
 Use `scripts/test_all.sh` rather than running suites directly: the tests import
 `mlx_lm.models.kimi_k3`, so editing `kimi_k3.py` without re-registering it
@@ -663,13 +664,34 @@ RDMA. A missing RDMA/JACCL fabric is an error, not a performance-degrading
 fallback. `scripts/distributed_generate.py` retains the separately proven
 point-to-point pipeline for diagnosis and regression testing.
 
+For regular use, keep one model/JACCL context resident. This avoids the costly
+reload and the JACCL protection-domain exhaustion associated with repeated
+initialisation, while continuous micro-batching recovers throughput from this
+dispatch-bound model:
+
+```bash
+scripts/configure_jaccl.sh
+scripts/run_tensor_server.sh --decode-concurrency 32 --prompt-concurrency 4
+
+curl http://127.0.0.1:8080/v1/chat/completions \
+  -H 'content-type: application/json' \
+  -d '{"model":"Kimi-K3-2bit-UVMAX","messages":[{"role":"user","content":"Who is Albert Einstein?"}],"max_tokens":256}'
+```
+
+The HTTP endpoint runs on Beast1. Each micro-batch is forwarded to Beast2 over
+a small control socket, but every model collective is still strict JACCL over
+Thunderbolt RDMA. Beast1 checks a SHA-256 digest of rank-local token outputs
+before returning the OpenAI-compatible, non-streaming response. `/health` shows
+resident-service and queue state. Bind remains loopback-only by default; use an
+SSH tunnel for remote access rather than exposing the unauthenticated endpoint.
+
 ## Status
 
 - [x] text architecture port (`kimi_k3.py`)
 - [x] **vision tower** (`kimi_k3_vision.py`) — parity vs torch at full K3 dims, 1.5e-6
 - [x] streaming converter + verifier, 4 profiles, round-trip tested
 - [x] MXFP4 → MLX mxfp4 bit-exact passthrough proven
-- [x] 101 tests discovered: 94 passing, 7 hardware/reference-data skips
+- [x] 105 tests discovered: 98 passing, 7 hardware/reference-data skips
 - [x] source download (1.56 TB)
 - [x] real conversions
 - [x] **mlx-vlm wrapper** (`kimi_k3_vl/`) — expanding `<|media_pad|>` merge,
@@ -683,6 +705,7 @@ point-to-point pipeline for diagnosis and regression testing.
 - [x] exact 64-token/32-step tensor parity over real two-host JACCL/RDMA
 - [x] production runner hard-requires JACCL and two ranks
 - [x] full tensor-parallel two-M3-Ultra JACCL generation and canonical benchmark
+- [x] persistent OpenAI-compatible serving with deterministic micro-batching and cross-rank output proof
 - [ ] AWQ re-run on a balanced calibration corpus (in progress)
 - [ ] tok/s re-measured for all published tiers after the wiring fix
 
